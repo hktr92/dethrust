@@ -4,3 +4,4 @@
 
 pub mod binary;
 pub mod flic;
+pub mod image;
