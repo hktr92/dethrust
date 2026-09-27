@@ -1,3 +1,7 @@
+mod decoder;
+
+pub use decoder::{FlicDecodeError, FlicDecodeErrorKind, FlicDecoder};
+
 use std::fmt;
 
 use crate::binary::{BinaryReadError, BinaryReadOperation, BinaryReader};
@@ -440,7 +444,7 @@ impl std::error::Error for FlicParseError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Flic, FlicFormat, FlicParseErrorKind};
+    use super::{Flic, FlicDecodeErrorKind, FlicDecoder, FlicFormat, FlicParseErrorKind};
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -487,6 +491,13 @@ mod tests {
         put_u16(&mut bytes, 12, 8);
         put_u16(&mut bytes, 14, 0);
         put_u16(&mut bytes, 16, 25);
+        bytes
+    }
+
+    fn decoder_file(frames: &[Vec<u8>], width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = file(0xaf12, frames);
+        put_u16(&mut bytes, 8, width);
+        put_u16(&mut bytes, 10, height);
         bytes
     }
 
@@ -619,5 +630,61 @@ mod tests {
                 available: bytes.len(),
             }
         );
+    }
+    #[test]
+    fn decodes_uncompressed_black_and_mini_frames_in_sequence() {
+        let frames = [
+            frame(&[chunk(16, &[1, 2, 3, 4, 5, 6])]),
+            frame(&[chunk(18, &[0xaa, 0xbb])]),
+            frame(&[chunk(13, &[])]),
+        ];
+        let bytes = decoder_file(&frames, 3, 2);
+        let flic = Flic::parse(&bytes).unwrap();
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+
+        assert_eq!(decoder.frame_position(), 0);
+        assert!(decoder.decode_next_frame().unwrap());
+        assert_eq!(decoder.image().pixels(), &[1, 2, 3, 4, 5, 6]);
+        assert!(decoder.decode_next_frame().unwrap());
+        assert_eq!(decoder.image().pixels(), &[1, 2, 3, 4, 5, 6]);
+        assert!(decoder.decode_next_frame().unwrap());
+        assert_eq!(decoder.image().pixels(), &[0; 6]);
+        assert_eq!(decoder.frame_position(), 3);
+        assert!(!decoder.decode_next_frame().unwrap());
+        assert_eq!(decoder.palette().entries().len(), 256);
+    }
+
+    #[test]
+    fn copy_chunk_ignores_extra_payload_bytes_and_keeps_chunks_separate() {
+        let frames = [frame(&[
+            chunk(16, &[1, 2, 3, 4, 5, 6, 0xee]),
+            chunk(16, &[7, 8, 9, 10, 11, 12]),
+        ])];
+        let bytes = decoder_file(&frames, 3, 2);
+        let flic = Flic::parse(&bytes).unwrap();
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+
+        assert!(decoder.decode_next_frame().unwrap());
+        assert_eq!(decoder.image().pixels(), &[7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn truncated_copy_does_not_read_from_the_following_chunk() {
+        let frames = [frame(&[chunk(16, &[1, 2, 3, 4, 5]), chunk(99, &[6])])];
+        let bytes = decoder_file(&frames, 3, 2);
+        let flic = Flic::parse(&bytes).unwrap();
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+
+        let error = decoder.decode_next_frame().unwrap_err();
+        assert_eq!(error.frame_index, Some(0));
+        assert_eq!(error.chunk_index, Some(0));
+        assert_eq!(
+            error.kind,
+            FlicDecodeErrorKind::CopyPayloadTooShort {
+                expected: 6,
+                available: 5,
+            }
+        );
+        assert_eq!(decoder.frame_position(), 0);
     }
 }
