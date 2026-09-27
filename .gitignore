@@ -1,0 +1,24 @@
+# Rust
+/target/
+
+# Local reverse-engineering references
+/.reference/
+
+# User-owned original game data
+/.carmageddon/
+/original-assets/
+/game-data/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Generated inspection/extraction output
+/out/
+/tmp/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
