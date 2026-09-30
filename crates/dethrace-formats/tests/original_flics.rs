@@ -16,6 +16,7 @@ fn decodes_original_fresh_boot_menu_flics() {
         "MAI2STIL.FLI",
         "MAI2COME.FLI",
         "MAI2AWAY.FLI",
+        "MAINCNIN.FLI",
         "MAI2N1FL.FLI",
         "MAI2N1GL.FLI",
         "MAI2NNFL.FLI",
