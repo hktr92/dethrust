@@ -215,10 +215,14 @@ fn log_vehicle_telemetry(
     *elapsed %= 1.0;
     let wheels = vehicle.state.wheels;
     let grounded = wheels.iter().filter(|wheel| wheel.grounded).count();
+    let slipping = wheels.iter().filter(|wheel| wheel.slipping).count();
     let compression = wheels.map(|wheel| (wheel.compression * 100.0).round() / 100.0);
+    let loads = wheels.map(|wheel| (wheel.normal_load * 100.0).round() / 100.0);
     let normals = wheels.map(|wheel| wheel.contact_normal.map(|v| (v * 100.0).round() / 100.0));
     bevy::log::info!(
-        "Vehicle wheels {grounded}/4, compression {compression:?}, normals {normals:?}, velocity {:?}, angular {:?}",
+        "Vehicle gear {}, revs {:.0}, wheels {grounded}/4 ({slipping} slipping), compression {compression:?}, loads {loads:?}, normals {normals:?}, velocity {:?}, angular {:?}",
+        vehicle.state.gear,
+        vehicle.state.engine_revs,
         vehicle.state.linear_velocity,
         vehicle.state.angular_velocity,
     );
@@ -412,16 +416,26 @@ mod tests {
             center_of_mass: [0.5, 0.0, 0.0],
             principal_inertia: [1.0; 3],
             wheel_positions: [
-                [-1.0, 1.0, -2.0],
-                [1.0, 1.0, -2.0],
                 [-1.0, 1.0, 2.0],
                 [1.0, 1.0, 2.0],
+                [-1.0, 1.0, -2.0],
+                [1.0, 1.0, -2.0],
             ],
             bounds: [[-2.0; 3], [2.0; 3]],
             ride_height: 1.0,
             suspension_travel: [1.0; 2],
             suspension_damping: 0.5,
             collision_world_scale: MECHANICS_WORLD_SCALE,
+            maximum_curvature: 0.08,
+            tyre_grip: [50.0, 60.0, 70.0],
+            force_reduction: 0.5,
+            friction_ellipticity: 1.0,
+            force_torque_ratio: 3000.0,
+            speed_revs_ratio: 0.001,
+            initial_brake: 12_000.0,
+            brake_increase: 12_000.0,
+            rolling_resistance: [0.02, 0.02],
+            max_gears: 4,
         }
     }
 

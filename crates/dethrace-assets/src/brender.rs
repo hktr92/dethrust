@@ -195,6 +195,20 @@ impl PlayerCarSources {
             }
         }
         let ride_height = bounds[0][1] + 0.01;
+        let rear_arm =
+            (self.mechanics.wheel_positions[0][2] - self.mechanics.center_of_mass[2]).abs();
+        let front_arm =
+            (self.mechanics.wheel_positions[2][2] - self.mechanics.center_of_mass[2]).abs();
+        let rear_share = front_arm / (front_arm + rear_arm);
+        let front_share = rear_arm / (front_arm + rear_arm);
+        let [front_grip, rear_grip, compression_grip] = self.mechanics.grip_angles_degrees;
+        let tyre_grip = [
+            rear_grip.to_radians().tan() * 0.25 * (self.mechanics.mass * rear_share * 5.0).sqrt(),
+            front_grip.to_radians().tan() * 0.25 * (self.mechanics.mass * front_share * 5.0).sqrt(),
+            compression_grip.to_radians().tan()
+                * 0.25
+                * (self.mechanics.mass * rear_share * 5.0).sqrt(),
+        ];
         let config = VehicleConfig {
             mass: self.mechanics.mass,
             center_of_mass: self
@@ -218,6 +232,16 @@ impl PlayerCarSources {
             ],
             suspension_damping: self.mechanics.damping,
             collision_world_scale: MECHANICS_WORLD_SCALE,
+            maximum_curvature: self.mechanics.maximum_curvature,
+            tyre_grip,
+            force_reduction: self.mechanics.force_reduction,
+            friction_ellipticity: self.mechanics.friction_ellipticity,
+            force_torque_ratio: self.mechanics.force_torque_ratio,
+            speed_revs_ratio: self.mechanics.speed_revs_ratio,
+            initial_brake: self.mechanics.initial_brake,
+            brake_increase: self.mechanics.brake_increase,
+            rolling_resistance: self.mechanics.rolling_resistance,
+            max_gears: self.mechanics.max_gears,
         };
         if !config.is_valid() {
             return Err(format!("{} has invalid converted mechanics", self.file));

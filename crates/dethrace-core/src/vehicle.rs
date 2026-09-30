@@ -43,12 +43,24 @@ pub struct VehicleConfig {
     pub suspension_damping: f32,
     /// Mechanics units per source track unit.
     pub collision_world_scale: f32,
+    pub maximum_curvature: f32,
+    /// Loader-scaled tyre limits in runtime order: rear, front, compression.
+    pub tyre_grip: [f32; 3],
+    pub force_reduction: f32,
+    pub friction_ellipticity: f32,
+    pub force_torque_ratio: f32,
+    pub speed_revs_ratio: f32,
+    pub initial_brake: f32,
+    pub brake_increase: f32,
+    /// Front and rear rolling resistance.
+    pub rolling_resistance: [f32; 2],
+    pub max_gears: i32,
 }
 
 impl VehicleConfig {
     pub fn is_valid(&self) -> bool {
-        let front_arm = (self.wheel_positions[0][2] - self.center_of_mass[2]).abs();
-        let rear_arm = (self.wheel_positions[2][2] - self.center_of_mass[2]).abs();
+        let rear_arm = (self.wheel_positions[0][2] - self.center_of_mass[2]).abs();
+        let front_arm = (self.wheel_positions[2][2] - self.center_of_mass[2]).abs();
         let valid = self.mass.is_finite()
             && self.mass > 0.0
             && self
@@ -72,6 +84,29 @@ impl VehicleConfig {
             && self.suspension_damping >= 0.0
             && self.collision_world_scale.is_finite()
             && self.collision_world_scale > 0.0
+            && self.maximum_curvature.is_finite()
+            && self.maximum_curvature > 0.0
+            && self
+                .tyre_grip
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+            && self.force_reduction.is_finite()
+            && self.force_reduction >= 0.0
+            && self.friction_ellipticity.is_finite()
+            && self.friction_ellipticity > 0.0
+            && self.force_torque_ratio.is_finite()
+            && self.force_torque_ratio > 0.0
+            && self.speed_revs_ratio.is_finite()
+            && self.speed_revs_ratio > 0.0
+            && self.initial_brake.is_finite()
+            && self.initial_brake >= 0.0
+            && self.brake_increase.is_finite()
+            && self.brake_increase >= 0.0
+            && self
+                .rolling_resistance
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            && self.max_gears > 0
             && front_arm.is_finite()
             && rear_arm.is_finite()
             && (front_arm + rear_arm).is_finite()
@@ -97,6 +132,8 @@ pub struct WheelState {
     /// within the sweep margin to recover small fixed-step penetrations.
     pub compression: f32,
     pub travel: f32,
+    pub normal_load: f32,
+    pub slipping: bool,
 }
 
 impl WheelState {
@@ -106,6 +143,7 @@ impl WheelState {
             && self.contact_normal.iter().all(|value| value.is_finite())
             && self.compression.is_finite()
             && self.travel.is_finite()
+            && self.normal_load.is_finite()
     }
 }
 
@@ -117,6 +155,9 @@ pub struct VehicleState {
     pub linear_velocity: [f32; 3],
     /// World-space angular velocity in radians per second.
     pub angular_velocity: [f32; 3],
+    /// -1 is reverse, 0 is neutral, positive values are automatic forward gears.
+    pub gear: i32,
+    pub engine_revs: f32,
     pub wheels: [WheelState; 4],
 }
 
@@ -127,6 +168,8 @@ impl Default for VehicleState {
             orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             linear_velocity: [0.0; 3],
             angular_velocity: [0.0; 3],
+            gear: 0,
+            engine_revs: 0.0,
             wheels: [WheelState::default(); 4],
         }
     }
@@ -138,6 +181,8 @@ impl VehicleState {
             && self.orientation_xyzw.iter().all(|value| value.is_finite())
             && self.linear_velocity.iter().all(|value| value.is_finite())
             && self.angular_velocity.iter().all(|value| value.is_finite())
+            && self.engine_revs.is_finite()
+            && self.engine_revs >= 0.0
             && self.wheels.iter().all(WheelState::is_finite)
     }
 }
@@ -239,18 +284,23 @@ impl VehicleSimulation {
         let dt = self.settings.fixed_step.as_secs_f32();
         let orientation = state.orientation_xyzw;
         let down = rotate(orientation, [0.0, -1.0, 0.0]);
+        let forward = rotate(orientation, [0.0, 0.0, -1.0]);
+        let forward_speed = dot(state.linear_velocity, forward);
+        let (gear, revs, engine_force, brake) = drivetrain(config, state, input, forward_speed, dt);
         let (spring_rates, damping_rates) = suspension_rates(config);
         let mut next = *state;
+        next.gear = gear;
+        next.engine_revs = revs;
         let mut wheels = [WheelState::default(); 4];
         let mut force = self.settings.gravity.map(|gravity| gravity * config.mass);
         let mut torque = [0.0; 3];
 
         for (index, wheel) in wheels.iter_mut().enumerate() {
-            let axle = usize::from(index >= 2);
+            // Source wheel indices 0-1 are rear, 2-3 are front; config travel is [front, rear].
+            let axle = if index < 2 { 1 } else { 0 };
             let lever = subtract(config.wheel_positions[index], config.center_of_mass);
             let lever_world = rotate(orientation, lever);
             let anchor = add(state.position, lever_world);
-            // Match the source wheel points and ray direction, with a small integration margin.
             let query_origin = subtract(anchor, scale(down, WHEEL_SWEEP_MARGIN));
             let source_origin = query_origin.map(|value| value / config.collision_world_scale);
             let source_reach =
@@ -274,6 +324,8 @@ impl VehicleSimulation {
                 contact_normal,
                 compression,
                 travel,
+                normal_load: 0.0,
+                slipping: false,
             };
 
             let point_velocity = add(
@@ -281,15 +333,102 @@ impl VehicleSimulation {
                 cross(state.angular_velocity, lever_world),
             );
             let compression_speed = -dot(point_velocity, contact_normal);
-            let magnitude = (spring_rates[axle] * compression
+            let normal_load = (spring_rates[axle] * compression
                 + damping_rates[axle] * compression_speed)
                 .max(0.0);
-            let contact_force = contact_normal.map(|component| component * magnitude);
+            let contact_force = contact_normal.map(|component| component * normal_load);
+            wheel.normal_load = normal_load;
             force = add(force, contact_force);
             torque = add(torque, cross(lever_world, contact_force));
         }
 
         next.wheels = wheels;
+        let grounded_count = next.wheels.iter().filter(|wheel| wheel.grounded).count();
+        if grounded_count > 0 {
+            let brake_force = (config.initial_brake + config.brake_increase) * brake;
+            let handbrake_force = config.initial_brake + config.brake_increase;
+            let curvature = -input.steering * config.maximum_curvature;
+            let wheelbase = (config.wheel_positions[0][2] - config.wheel_positions[2][2]).abs();
+            let steering_angle = (wheelbase * curvature).atan();
+
+            for (index, wheel) in next.wheels.iter_mut().enumerate() {
+                if !wheel.grounded || wheel.normal_load <= 0.0 {
+                    continue;
+                }
+                let rear = index < 2;
+                let lever = subtract(config.wheel_positions[index], config.center_of_mass);
+                let lever_world = rotate(orientation, lever);
+                let point_velocity = add(
+                    state.linear_velocity,
+                    cross(state.angular_velocity, lever_world),
+                );
+                let local_forward = if rear {
+                    [0.0, 0.0, -1.0]
+                } else {
+                    [-steering_angle.sin(), 0.0, -steering_angle.cos()]
+                };
+                let mut tire_forward = rotate(orientation, local_forward);
+                tire_forward = subtract(
+                    tire_forward,
+                    scale(
+                        wheel.contact_normal,
+                        dot(tire_forward, wheel.contact_normal),
+                    ),
+                );
+                let forward_length = dot(tire_forward, tire_forward).sqrt();
+                if forward_length <= f32::EPSILON {
+                    continue;
+                }
+                tire_forward = scale(tire_forward, forward_length.recip());
+                let mut tire_right = cross(tire_forward, wheel.contact_normal);
+                let right_length = dot(tire_right, tire_right).sqrt();
+                if right_length <= f32::EPSILON {
+                    continue;
+                }
+                tire_right = scale(tire_right, right_length.recip());
+
+                let longitudinal_speed = dot(point_velocity, tire_forward);
+                let lateral_speed = dot(point_velocity, tire_right);
+                let axle_brake = brake_force / 4.0
+                    + if rear && input.handbrake {
+                        handbrake_force / 2.0
+                    } else {
+                        0.0
+                    };
+                let stopping_force =
+                    config.mass * longitudinal_speed.abs() / (dt * grounded_count as f32);
+                let brakes = axle_brake.min(stopping_force) * -longitudinal_speed.signum();
+                let resistance = config.rolling_resistance[usize::from(rear)] * wheel.normal_load;
+                let rolling = resistance.min(stopping_force) * -longitudinal_speed.signum();
+                let drive = if rear { engine_force * 0.5 } else { 0.0 };
+                let longitudinal_force = drive + brakes + rolling;
+                let lateral_force = -config.mass * lateral_speed / (dt * grounded_count as f32);
+                let grip = if rear {
+                    let slip = (lateral_speed.abs() / 10.0).clamp(0.0, 1.0);
+                    config.tyre_grip[2] + (config.tyre_grip[0] - config.tyre_grip[2]) * slip
+                } else {
+                    config.tyre_grip[1]
+                };
+                let force_limit = wheel.normal_load.sqrt() * grip;
+                let demand = ((longitudinal_force / config.friction_ellipticity).powi(2)
+                    + lateral_force.powi(2))
+                .sqrt();
+                let scale_factor = if demand > force_limit && demand > f32::EPSILON {
+                    // ponytail: this independent-wheel ellipse is the ceiling; add axle force sharing if handling tests need it.
+                    force_limit / demand * config.force_reduction.min(1.0)
+                } else {
+                    1.0
+                };
+                wheel.slipping = demand > force_limit;
+                let contact_force = add(
+                    scale(tire_forward, longitudinal_force * scale_factor),
+                    scale(tire_right, lateral_force * scale_factor),
+                );
+                force = add(force, contact_force);
+                torque = add(torque, cross(lever_world, contact_force));
+            }
+        }
+
         for (axis, force_component) in force.iter().enumerate() {
             next.linear_velocity[axis] += force_component / config.mass * dt;
             next.position[axis] += next.linear_velocity[axis] * dt;
@@ -315,11 +454,68 @@ impl VehicleSimulation {
     }
 }
 
+fn drivetrain(
+    config: &VehicleConfig,
+    state: &VehicleState,
+    input: DriverInput,
+    forward_speed: f32,
+    dt: f32,
+) -> (i32, f32, f32, f32) {
+    let mut gear = state.gear.clamp(-1, config.max_gears);
+    if forward_speed.abs() < 1.0 {
+        if gear == 0 && input.throttle > 0.0 && input.brake == 0.0 {
+            gear = 1;
+        } else if gear >= 0 && input.brake > 0.0 && input.throttle == 0.0 {
+            gear = -1;
+        } else if gear < 0 && input.throttle > 0.0 && input.brake == 0.0 {
+            gear = 1;
+        }
+    }
+    if gear > 0 {
+        let target_revs = forward_speed.abs() / config.speed_revs_ratio / gear as f32;
+        if target_revs > 6000.0 && gear < config.max_gears {
+            gear += 1;
+        } else if target_revs < 3000.0 && gear > 1 {
+            gear -= 1;
+        }
+    }
+
+    // ponytail: wheel-speed RPM omits engine inertia; add it if original-data handling tests need rev transients.
+    let revs = if gear == 0 {
+        0.0
+    } else {
+        (forward_speed.abs() / config.speed_revs_ratio / gear.abs() as f32).min(8000.0)
+    };
+    let throttle = if gear < 0 {
+        input.brake
+    } else {
+        input.throttle
+    };
+    let brake = if gear < 0 {
+        input.throttle
+    } else {
+        input.brake
+    };
+    let engine_force = if gear == 0 || brake > 0.0 {
+        0.0
+    } else if throttle > 0.0 {
+        config.force_torque_ratio * (1.2 * throttle - revs * revs / 100_000_000.0 - 0.2)
+            / gear as f32
+    } else if forward_speed.abs() > 0.05 {
+        let drag =
+            config.force_torque_ratio * (revs * revs / 100_000_000.0 + 0.2) / gear.abs() as f32;
+        -forward_speed.signum() * drag.min(config.mass * forward_speed.abs() / dt)
+    } else {
+        0.0
+    };
+    (gear, revs, engine_force, brake)
+}
+
 fn suspension_rates(config: &VehicleConfig) -> ([f32; 2], [f32; 2]) {
     // SetCarSuspGiveAndHeight uses a factor of five for both original axle rates.
-    let front_arm = (config.wheel_positions[0][2] - config.center_of_mass[2]).abs();
-    let rear_arm = (config.wheel_positions[2][2] - config.center_of_mass[2]).abs();
-    let front_share = front_arm / (front_arm + rear_arm);
+    let rear_arm = (config.wheel_positions[0][2] - config.center_of_mass[2]).abs();
+    let front_arm = (config.wheel_positions[2][2] - config.center_of_mass[2]).abs();
+    let front_share = rear_arm / (front_arm + rear_arm);
     let rear_share = 1.0 - front_share;
     let shares = [front_share, rear_share];
     let spring = std::array::from_fn(|axle| {
@@ -423,16 +619,26 @@ mod tests {
             center_of_mass: [0.0; 3],
             principal_inertia: [1000.0; 3],
             wheel_positions: [
-                [-1.0, 1.0, -2.0],
-                [1.0, 1.0, -2.0],
                 [-1.0, 1.0, 2.0],
                 [1.0, 1.0, 2.0],
+                [-1.0, 1.0, -2.0],
+                [1.0, 1.0, -2.0],
             ],
             bounds: [[-2.0, 0.0, -3.0], [2.0, 2.0, 3.0]],
             ride_height: 1.0,
             suspension_travel: [2.0; 2],
             suspension_damping: 0.5,
             collision_world_scale: 1.0,
+            maximum_curvature: 0.08,
+            tyre_grip: [50.0, 60.0, 70.0],
+            force_reduction: 0.5,
+            friction_ellipticity: 1.0,
+            force_torque_ratio: 3000.0,
+            speed_revs_ratio: 0.001,
+            initial_brake: 12_000.0,
+            brake_increase: 12_000.0,
+            rolling_resistance: [0.02, 0.02],
+            max_gears: 4,
         }
     }
 
@@ -538,6 +744,193 @@ mod tests {
             }
             .is_valid()
         );
+        assert!(
+            !VehicleConfig {
+                speed_revs_ratio: 0.0,
+                ..config
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn throttle_coast_brake_and_reverse_follow_the_drivetrain() {
+        let simulation = VehicleSimulation::new(VehicleSimulationSettings::default()).unwrap();
+        let config = vehicle_config();
+        let ground = flat_ground();
+        let mut neutral = VehicleState {
+            linear_velocity: [0.0, 0.0, -5.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut neutral, &config, DriverInput::default(), &ground)
+            .unwrap();
+        assert!(neutral.linear_velocity[2] > -5.0 && neutral.linear_velocity[2] < 0.0);
+
+        let mut forward = VehicleState::default();
+        for _ in 0..40 {
+            simulation
+                .step_fixed(
+                    &mut forward,
+                    &config,
+                    DriverInput {
+                        throttle: 1.0,
+                        ..DriverInput::default()
+                    },
+                    &ground,
+                )
+                .unwrap();
+        }
+        assert!(forward.linear_velocity[2] < -1.0);
+        assert!(forward.gear > 0);
+
+        let mut reverse = VehicleState::default();
+        for _ in 0..40 {
+            simulation
+                .step_fixed(
+                    &mut reverse,
+                    &config,
+                    DriverInput {
+                        brake: 1.0,
+                        ..DriverInput::default()
+                    },
+                    &ground,
+                )
+                .unwrap();
+        }
+        assert!(reverse.linear_velocity[2] > 1.0);
+        assert_eq!(reverse.gear, -1);
+
+        let mut braking = VehicleState {
+            linear_velocity: [0.0, 0.0, -5.0],
+            gear: 1,
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(
+                &mut braking,
+                &config,
+                DriverInput {
+                    brake: 1.0,
+                    ..DriverInput::default()
+                },
+                &ground,
+            )
+            .unwrap();
+        assert!(braking.linear_velocity[2] > -5.0);
+    }
+
+    #[test]
+    fn steering_turns_symmetrically_in_both_directions() {
+        let simulation = VehicleSimulation::new(VehicleSimulationSettings::default()).unwrap();
+        let config = vehicle_config();
+        let ground = flat_ground();
+        let mut right = VehicleState {
+            linear_velocity: [0.0, 0.0, -5.0],
+            gear: 1,
+            ..VehicleState::default()
+        };
+        let mut left = right;
+        for _ in 0..30 {
+            simulation
+                .step_fixed(
+                    &mut right,
+                    &config,
+                    DriverInput {
+                        steering: 1.0,
+                        ..DriverInput::default()
+                    },
+                    &ground,
+                )
+                .unwrap();
+            simulation
+                .step_fixed(
+                    &mut left,
+                    &config,
+                    DriverInput {
+                        steering: -1.0,
+                        ..DriverInput::default()
+                    },
+                    &ground,
+                )
+                .unwrap();
+        }
+        assert!(right.position[0] > 0.0, "{right:?}");
+        assert!(left.position[0] < 0.0, "{left:?}");
+        assert!(
+            (right.position[0] + left.position[0]).abs() < 0.05,
+            "right={right:?} left={left:?}"
+        );
+    }
+
+    #[test]
+    fn handbrake_limits_rear_tyre_grip() {
+        let simulation = VehicleSimulation::new(VehicleSimulationSettings::default()).unwrap();
+        let config = vehicle_config();
+        let ground = flat_ground();
+        let mut coasting = VehicleState {
+            linear_velocity: [0.0, 0.0, -5.0],
+            gear: 1,
+            ..VehicleState::default()
+        };
+        let mut handbraking = coasting;
+        simulation
+            .step_fixed(&mut coasting, &config, DriverInput::default(), &ground)
+            .unwrap();
+        simulation
+            .step_fixed(
+                &mut handbraking,
+                &config,
+                DriverInput {
+                    handbrake: true,
+                    ..DriverInput::default()
+                },
+                &ground,
+            )
+            .unwrap();
+        assert!(handbraking.linear_velocity[2] > coasting.linear_velocity[2]);
+        assert!(handbraking.wheels[..2].iter().any(|wheel| wheel.slipping));
+    }
+
+    #[test]
+    fn aggressive_steering_and_braking_remain_finite() {
+        let simulation = VehicleSimulation::new(VehicleSimulationSettings::default()).unwrap();
+        let config = vehicle_config();
+        let ground = flat_ground();
+        let mut state = VehicleState::default();
+        for step in 0..1000 {
+            let input = if step % 2 == 0 {
+                DriverInput {
+                    steering: 1.0,
+                    throttle: 1.0,
+                    handbrake: true,
+                    ..DriverInput::default()
+                }
+            } else {
+                DriverInput {
+                    steering: -1.0,
+                    brake: 1.0,
+                    ..DriverInput::default()
+                }
+            };
+            simulation
+                .step_fixed(&mut state, &config, input, &ground)
+                .unwrap();
+            assert!(state.is_finite());
+        }
+    }
+
+    #[test]
+    fn asymmetric_suspension_uses_source_rear_and_front_wheels() {
+        let simulation = VehicleSimulation::new(VehicleSimulationSettings::default()).unwrap();
+        let mut config = vehicle_config();
+        config.suspension_travel = [1.0, 3.0];
+        let mut state = VehicleState::default();
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &flat_ground())
+            .unwrap();
+        assert!(state.wheels[..2].iter().all(|wheel| wheel.travel == 3.0));
+        assert!(state.wheels[2..].iter().all(|wheel| wheel.travel == 1.0));
     }
 
     #[test]

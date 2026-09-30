@@ -35,6 +35,32 @@ fn resolves_and_spawns_the_original_player_car_at_maim_street_start() {
     assert!(player.file.eq_ignore_ascii_case("BLKEAGLE.TXT"));
     let config = player.vehicle_config().unwrap();
     assert!(config.is_valid());
+    assert_eq!(config.maximum_curvature, player.mechanics.maximum_curvature);
+    assert_eq!(
+        config.force_torque_ratio,
+        player.mechanics.force_torque_ratio
+    );
+    assert_eq!(config.speed_revs_ratio, player.mechanics.speed_revs_ratio);
+    assert_eq!(config.max_gears, player.mechanics.max_gears);
+    let rear_arm =
+        (player.mechanics.wheel_positions[0][2] - player.mechanics.center_of_mass[2]).abs();
+    let front_arm =
+        (player.mechanics.wheel_positions[2][2] - player.mechanics.center_of_mass[2]).abs();
+    let rear_share = front_arm / (front_arm + rear_arm);
+    let front_share = rear_arm / (front_arm + rear_arm);
+    let [front_grip, rear_grip, compression_grip] = player.mechanics.grip_angles_degrees;
+    let expected_grip = [
+        rear_grip.to_radians().tan() * 0.25 * (config.mass * rear_share * 5.0).sqrt(),
+        front_grip.to_radians().tan() * 0.25 * (config.mass * front_share * 5.0).sqrt(),
+        compression_grip.to_radians().tan() * 0.25 * (config.mass * rear_share * 5.0).sqrt(),
+    ];
+    assert_eq!(config.tyre_grip, expected_grip);
+    assert_eq!(config.initial_brake, player.mechanics.initial_brake);
+    assert_eq!(config.brake_increase, player.mechanics.brake_increase);
+    assert_eq!(
+        config.rolling_resistance,
+        player.mechanics.rolling_resistance
+    );
     let principal = player.scene.actor.roots.first().unwrap();
     let actor_offset = source_transform(&principal.transform)
         .translation
@@ -112,6 +138,28 @@ fn resolves_and_spawns_the_original_player_car_at_maim_street_start() {
             .sum::<f32>()
             .sqrt()
             < 0.01
+    );
+
+    let mut driven = settled;
+    for _ in 0..40 {
+        simulation
+            .step_fixed(
+                &mut driven,
+                &config,
+                dethrace_core::vehicle::DriverInput {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+                &collision,
+            )
+            .unwrap();
+    }
+    let start_forward = Quat::from_rotation_y(track.spec.start_yaw_degrees.to_radians()) * -Vec3::Z;
+    let forward_speed = start_forward.dot(Vec3::from_array(driven.linear_velocity));
+    assert!(driven.is_finite());
+    assert!(
+        forward_speed > 0.5,
+        "player car did not pull away: {driven:?}"
     );
 
     let mut images = Assets::<Image>::default();
