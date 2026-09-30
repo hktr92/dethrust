@@ -19,8 +19,10 @@ use bevy::mesh::{Mesh, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face as CullFace, TextureDimension, TextureFormat};
 use dethrace_core::collision::{StaticCollisionWorld, SurfaceIdentity};
+use dethrace_core::vehicle::VehicleConfig;
 use dethrace_formats::{
     act::{ActFile, Actor, ActorTransform},
+    car_mechanics::CarMechanicsSpec,
     car_visual::{CarVisualSpec, VisualVariant},
     dat::{DatFile, Model},
     mat::{MatFile, Material},
@@ -30,6 +32,8 @@ use dethrace_formats::{
 };
 
 use crate::GameDir;
+
+pub use dethrace_formats::car_mechanics::{MECHANICS_INERTIA_SCALE, MECHANICS_WORLD_SCALE};
 
 fn key(name: &str) -> String {
     name.to_ascii_uppercase()
@@ -139,6 +143,80 @@ pub struct VisualScene {
     pub materials: Vec<MatFile>,
     pub models: Vec<DatFile>,
     pub palette: [[u8; 3]; 256],
+}
+
+/// Original player car visuals and source mechanics resolved from GENERAL.TXT.
+pub struct PlayerCarSources {
+    pub file: String,
+    pub mechanics: CarMechanicsSpec,
+    pub scene: VisualScene,
+}
+
+impl PlayerCarSources {
+    pub fn initial(dir: &GameDir) -> Result<Self, String> {
+        let general_path = dir.data_path("GENERAL.TXT")?;
+        let (_, file) = initial_player(&read(&general_path)?)
+            .map_err(|error| format!("{}: {error}", general_path.display()))?;
+        Self::load(dir, &file)
+    }
+
+    pub fn load(dir: &GameDir, file: &str) -> Result<Self, String> {
+        let path = dir.asset_path("CARS", file)?;
+        let bytes = read(&path)?;
+        let mechanics = CarMechanicsSpec::parse(&bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let visual =
+            CarVisualSpec::parse(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        let scene = VisualScene::car(dir, &visual, VisualVariant::Low)?;
+        Ok(Self {
+            file: file.to_owned(),
+            mechanics,
+            scene,
+        })
+    }
+
+    /// Converts source mechanics to the units used by the original mechanics loop.
+    pub fn vehicle_config(&self) -> Result<VehicleConfig, String> {
+        let principal = self
+            .scene
+            .actor
+            .roots
+            .first()
+            .ok_or("principal car ACT has no root actor")?;
+        let actor_offset = match &principal.transform {
+            ActorTransform::Identity => [0.0; 3],
+            ActorTransform::Translation(position) => *position,
+            ActorTransform::Matrix34(rows) => rows[3],
+        };
+        let mut bounds = self.mechanics.bounds;
+        for point in &mut bounds {
+            for axis in 0..3 {
+                point[axis] += actor_offset[axis];
+            }
+        }
+        let ride_height = bounds[0][1] + 0.01;
+        let config = VehicleConfig {
+            mass: self.mechanics.mass,
+            center_of_mass: self
+                .mechanics
+                .center_of_mass
+                .map(|value| value * MECHANICS_WORLD_SCALE),
+            principal_inertia: self
+                .mechanics
+                .principal_inertia
+                .map(|value| value * MECHANICS_INERTIA_SCALE),
+            wheel_positions: std::array::from_fn(|index| {
+                let mut position = self.mechanics.wheel_positions[index];
+                position[1] = ride_height;
+                position.map(|value| value * MECHANICS_WORLD_SCALE)
+            }),
+            bounds: bounds.map(|point| point.map(|value| value * MECHANICS_WORLD_SCALE)),
+        };
+        if !config.is_valid() {
+            return Err(format!("{} has invalid converted mechanics", self.file));
+        }
+        Ok(config)
+    }
 }
 
 pub struct TrackSources {

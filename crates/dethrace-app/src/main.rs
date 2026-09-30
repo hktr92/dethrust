@@ -7,8 +7,9 @@ use bevy::prelude::*;
 use bevy::window::WindowResolution;
 use dethrace_assets::{
     FlicClip, GameDir,
-    brender::{GallerySources, TrackSources, VisualScene},
+    brender::{GallerySources, PlayerCarSources, TrackSources, VisualScene},
 };
+use dethrace_game::drive::{MaimStreetDrivePlugin, MaimStreetDriveSource};
 use dethrace_game::{TrackViewerPlugin, TrackViewerSource};
 use dethrace_ui::gallery::{DamageGalleryPlugin, GalleryPresentation};
 use dethrace_ui::{ButtonClip, MENU_CHOICES, MainMenuPlugin, MenuClips};
@@ -101,11 +102,30 @@ fn run_maim_street(game_dir: &GameDir) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_maim_street_drive(game_dir: &GameDir) -> Result<(), Box<dyn Error>> {
+    let track = TrackSources::load(game_dir, "Maim Street")?;
+    let player = PlayerCarSources::initial(game_dir)?;
+    App::new()
+        .insert_resource(MaimStreetDriveSource(Some((track, player))))
+        .insert_resource(ClearColor(Color::srgb(0.12, 0.14, 0.18)))
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Maim Street player car".into(),
+                resolution: WindowResolution::new(960, 600),
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_plugins(MaimStreetDrivePlugin)
+        .run();
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if args.len() < 2 || args[0] != OsStr::new("--game-dir") {
         return Err(
-            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street|maim-street]"
+            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street|maim-street|maim-street-drive]"
                 .into(),
         );
     }
@@ -125,9 +145,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return run_maim_street(&game_dir);
     }
+    if args.len() == 4
+        && args[2] == OsStr::new("--debug-scene")
+        && args[3] == OsStr::new("maim-street-drive")
+    {
+        return run_maim_street_drive(&game_dir);
+    }
     if args.len() != 2 {
         return Err(
-            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street|maim-street]"
+            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street|maim-street|maim-street-drive]"
                 .into(),
         );
     }

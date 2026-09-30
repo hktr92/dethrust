@@ -1,6 +1,7 @@
 //! Static original-data inspection; the M2 drive scene is assembled separately.
 
 pub mod collision;
+pub mod drive;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;

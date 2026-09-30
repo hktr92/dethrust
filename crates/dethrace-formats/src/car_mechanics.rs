@@ -6,7 +6,8 @@
 use crate::game_text::{DataLine, GameText, TextError};
 
 const MECHANICS_HEADER: &str = "START OF MECHANICS STUFF";
-const WORLD_SCALE: f32 = 6.9;
+pub const MECHANICS_WORLD_SCALE: f32 = 6.9;
+pub const MECHANICS_INERTIA_SCALE: f32 = 47.61;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarMechanicsSpec {
@@ -19,7 +20,7 @@ pub struct CarMechanicsSpec {
     pub extra_points: Vec<[f32; 3]>,
     /// Raw mechanics-section value; the loader inverts it before scaling.
     pub maximum_curve_radius: f32,
-    /// Original loader result: 1 / maximum_curve_radius / WORLD_SCALE.
+    /// Original loader result: 1 / maximum_curve_radius / MECHANICS_WORLD_SCALE.
     pub maximum_curvature: f32,
     /// Runtime slot order [rear, front]; the source pair is read into [front, rear].
     pub suspension_give: [f32; 2],
@@ -47,7 +48,7 @@ pub struct CarMechanicsSpec {
     /// Original loader derived drivetrain ratios.
     pub speed_revs_ratio: f32,
     pub force_torque_ratio: f32,
-    /// Principal inertia calculated from source dimensions, before the loader's 47.61 scale.
+    /// Principal inertia calculated from source dimensions, before the loader's mechanics inertia scale.
     pub principal_inertia: [f32; 3],
 }
 
@@ -201,7 +202,7 @@ impl CarMechanicsSpec {
 
         let (curve_line, [maximum_curve_radius]) = values(&mut text, "maximum curve radius")?;
         positive(curve_line, maximum_curve_radius, "maximum curve radius")?;
-        let maximum_curvature = 1.0 / maximum_curve_radius / WORLD_SCALE;
+        let maximum_curvature = 1.0 / maximum_curve_radius / MECHANICS_WORLD_SCALE;
         if !maximum_curvature.is_finite() {
             return Err(TextError::new(curve_line, "invalid maximum curvature"));
         }
