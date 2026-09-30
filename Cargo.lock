@@ -29,6 +29,9 @@ version = "0.1.0"
 [[package]]
 name = "dethrace-tools"
 version = "0.1.0"
+dependencies = [
+ "dethrace-formats",
+]
 
 [[package]]
 name = "dethrace-ui"
