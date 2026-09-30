@@ -1,10 +1,11 @@
+use bevy::input::gamepad::{Gamepad, GamepadAxis, GamepadButton};
 use bevy::prelude::*;
 use dethrace_assets::brender::{
     MECHANICS_WORLD_SCALE, PlayerCarSources, TrackSources, build_collision_world,
 };
 use dethrace_core::{
     collision::StaticCollisionWorld,
-    vehicle::{VehicleConfig, VehicleState},
+    vehicle::{DriverInput, VehicleConfig, VehicleState},
 };
 
 use crate::collision::TrackCollisionWorld;
@@ -17,17 +18,167 @@ pub struct PlayerVehicle {
     pub car_file: String,
     pub state: VehicleState,
     pub config: VehicleConfig,
+    pub driver_input: DriverInput,
 }
 
 #[derive(Component)]
 pub struct SimulationVehicleRoot;
 
+#[derive(Resource, Default)]
+pub struct DriverInputTelemetry {
+    pub enabled: bool,
+}
+
+#[derive(Default)]
+struct PlayerControls {
+    keyboard_left: bool,
+    keyboard_right: bool,
+    keyboard_throttle: bool,
+    keyboard_brake: bool,
+    keyboard_handbrake: bool,
+    gamepad_left: bool,
+    gamepad_right: bool,
+    gamepad_steering: f32,
+    gamepad_throttle: f32,
+    gamepad_brake: f32,
+    gamepad_throttle_button: bool,
+    gamepad_brake_button: bool,
+    gamepad_handbrake: bool,
+}
+
 pub struct MaimStreetDrivePlugin;
 
 impl Plugin for MaimStreetDrivePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_drive_scene)
-            .add_systems(Update, sync_vehicle_presentation);
+        app.init_resource::<DriverInputTelemetry>()
+            .add_systems(Startup, spawn_drive_scene)
+            .add_systems(
+                Update,
+                (
+                    map_player_controls,
+                    toggle_input_telemetry,
+                    log_driver_input,
+                    sync_vehicle_presentation,
+                )
+                    .chain(),
+            );
+    }
+}
+
+const STEERING_DEADZONE: f32 = 0.15;
+const PEDAL_DEADZONE: f32 = 0.03;
+
+fn digital_axis(negative: bool, positive: bool) -> f32 {
+    positive as i8 as f32 - negative as i8 as f32
+}
+
+fn normalize_steering(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let value = value.clamp(-1.0, 1.0);
+    let magnitude = value.abs();
+    if magnitude <= STEERING_DEADZONE {
+        0.0
+    } else {
+        value.signum() * (magnitude - STEERING_DEADZONE) / (1.0 - STEERING_DEADZONE)
+    }
+}
+
+fn normalize_pedal(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let value = value.clamp(0.0, 1.0);
+    if value <= PEDAL_DEADZONE {
+        0.0
+    } else {
+        (value - PEDAL_DEADZONE) / (1.0 - PEDAL_DEADZONE)
+    }
+}
+
+fn normalize_controls(controls: PlayerControls) -> DriverInput {
+    let steering = (digital_axis(
+        controls.keyboard_left || controls.gamepad_left,
+        controls.keyboard_right || controls.gamepad_right,
+    ) + normalize_steering(controls.gamepad_steering))
+    .clamp(-1.0, 1.0);
+    let digital_throttle = controls.keyboard_throttle || controls.gamepad_throttle_button;
+    let digital_brake = controls.keyboard_brake || controls.gamepad_brake_button;
+    let (digital_throttle, digital_brake) = if digital_throttle && digital_brake {
+        (0.0, 0.0)
+    } else {
+        (digital_throttle as u8 as f32, digital_brake as u8 as f32)
+    };
+    DriverInput {
+        steering,
+        throttle: digital_throttle.max(normalize_pedal(controls.gamepad_throttle)),
+        brake: digital_brake.max(normalize_pedal(controls.gamepad_brake)),
+        handbrake: controls.keyboard_handbrake || controls.gamepad_handbrake,
+    }
+}
+
+fn map_player_controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut vehicle: ResMut<PlayerVehicle>,
+) {
+    let gamepad = gamepads.iter().next();
+    let controls = PlayerControls {
+        keyboard_left: keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft),
+        keyboard_right: keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight),
+        keyboard_throttle: keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp),
+        keyboard_brake: keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown),
+        keyboard_handbrake: keys.pressed(KeyCode::Space),
+        gamepad_left: gamepad.is_some_and(|pad| pad.pressed(GamepadButton::DPadLeft)),
+        gamepad_right: gamepad.is_some_and(|pad| pad.pressed(GamepadButton::DPadRight)),
+        gamepad_steering: gamepad
+            .and_then(|pad| pad.get(GamepadAxis::LeftStickX))
+            .unwrap_or(0.0),
+        gamepad_throttle: gamepad
+            .and_then(|pad| pad.get(GamepadButton::RightTrigger2))
+            .unwrap_or(0.0),
+        gamepad_brake: gamepad
+            .and_then(|pad| pad.get(GamepadButton::LeftTrigger2))
+            .unwrap_or(0.0),
+        gamepad_throttle_button: gamepad.is_some_and(|pad| {
+            pad.pressed(GamepadButton::South) || pad.pressed(GamepadButton::RightTrigger)
+        }),
+        gamepad_brake_button: gamepad.is_some_and(|pad| {
+            pad.pressed(GamepadButton::West) || pad.pressed(GamepadButton::LeftTrigger)
+        }),
+        gamepad_handbrake: gamepad.is_some_and(|pad| pad.pressed(GamepadButton::East)),
+    };
+    let input = normalize_controls(controls);
+    if vehicle.driver_input != input {
+        vehicle.driver_input = input;
+    }
+}
+
+fn toggle_input_telemetry(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut telemetry: ResMut<DriverInputTelemetry>,
+) {
+    if keys.just_pressed(KeyCode::F1) {
+        telemetry.enabled = !telemetry.enabled;
+    }
+}
+
+fn log_driver_input(
+    vehicle: Res<PlayerVehicle>,
+    telemetry: Res<DriverInputTelemetry>,
+    mut previous: Local<Option<DriverInput>>,
+    mut was_enabled: Local<bool>,
+) {
+    if telemetry.enabled {
+        if !*was_enabled || *previous != Some(vehicle.driver_input) {
+            bevy::log::info!("Player DriverInput: {:?}", vehicle.driver_input);
+        }
+        *was_enabled = true;
+        *previous = Some(vehicle.driver_input);
+    } else {
+        *was_enabled = false;
+        *previous = Some(vehicle.driver_input);
     }
 }
 
@@ -87,6 +238,7 @@ fn spawn_drive_scene(
         car_file,
         state,
         config,
+        driver_input: DriverInput::default(),
     });
 
     track
@@ -143,8 +295,65 @@ fn sync_vehicle_presentation(
 mod tests {
     use bevy::prelude::{Quat, Vec3};
     use dethrace_assets::brender::MECHANICS_WORLD_SCALE;
+    use dethrace_core::vehicle::DriverInput;
 
-    use super::{presentation_transform, resolve_start_position, state_at_start};
+    use super::{
+        PlayerControls, normalize_controls, normalize_pedal, normalize_steering,
+        presentation_transform, resolve_start_position, state_at_start,
+    };
+
+    #[test]
+    fn opposing_digital_inputs_cancel() {
+        let input = normalize_controls(PlayerControls {
+            keyboard_left: true,
+            keyboard_right: true,
+            keyboard_throttle: true,
+            gamepad_brake_button: true,
+            ..PlayerControls::default()
+        });
+        assert_eq!(input, DriverInput::default());
+    }
+
+    #[test]
+    fn analog_controls_apply_deadzone_and_clamp() {
+        assert_eq!(normalize_steering(0.1), 0.0);
+        assert!((normalize_steering(0.575) - 0.5).abs() < 1e-6);
+        assert_eq!(normalize_steering(5.0), 1.0);
+        assert_eq!(normalize_steering(f32::NAN), 0.0);
+        assert_eq!(normalize_pedal(-1.0), 0.0);
+        assert_eq!(normalize_pedal(5.0), 1.0);
+    }
+
+    #[test]
+    fn releasing_controls_returns_to_neutral() {
+        let pressed = normalize_controls(PlayerControls {
+            keyboard_right: true,
+            keyboard_throttle: true,
+            keyboard_handbrake: true,
+            ..PlayerControls::default()
+        });
+        assert_eq!(pressed.steering, 1.0);
+        assert_eq!(pressed.throttle, 1.0);
+        assert!(pressed.handbrake);
+        assert_eq!(
+            normalize_controls(PlayerControls::default()),
+            DriverInput::default()
+        );
+    }
+
+    #[test]
+    fn maps_gamepad_triggers_and_handbrake() {
+        let input = normalize_controls(PlayerControls {
+            gamepad_throttle: 0.515,
+            gamepad_brake_button: true,
+            gamepad_handbrake: true,
+            ..PlayerControls::default()
+        });
+        assert!((input.throttle - 0.5).abs() < 1e-6);
+        assert_eq!(input.brake, 1.0);
+        assert!(input.handbrake);
+        assert!(input.is_valid());
+    }
 
     #[test]
     fn grid_spawn_snaps_to_the_nearest_track_surface() {
