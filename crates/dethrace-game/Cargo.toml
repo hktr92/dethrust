@@ -7,4 +7,5 @@ rust-version.workspace = true
 
 [dependencies]
 bevy.workspace = true
+dethrace-core = { path = "../dethrace-core" }
 dethrace-assets = { path = "../dethrace-assets" }

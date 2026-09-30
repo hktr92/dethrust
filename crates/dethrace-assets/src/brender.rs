@@ -11,12 +11,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
 use bevy::mesh::{Mesh, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face as CullFace, TextureDimension, TextureFormat};
+use dethrace_core::collision::{StaticCollisionWorld, SurfaceIdentity};
 use dethrace_formats::{
     act::{ActFile, Actor, ActorTransform},
     car_visual::{CarVisualSpec, VisualVariant},
@@ -164,6 +166,114 @@ impl TrackSources {
         )?;
         Ok(Self { spec, scene })
     }
+}
+
+pub fn build_collision_world(track: &TrackSources) -> Result<StaticCollisionWorld, String> {
+    let mut models = HashMap::new();
+    for model in track.scene.models.iter().flat_map(|file| &file.models) {
+        models.entry(key(&model.identifier)).or_insert(model);
+    }
+    let mut materials = HashMap::new();
+    for material in track
+        .scene
+        .materials
+        .iter()
+        .flat_map(|file| &file.materials)
+    {
+        materials
+            .entry(key(&material.identifier))
+            .or_insert(material);
+    }
+
+    fn add_actor(
+        actor: &Actor,
+        parent_transform: Mat4,
+        parent_path: &str,
+        models: &HashMap<String, &Model>,
+        materials: &HashMap<String, &Material>,
+        world: &mut StaticCollisionWorld,
+    ) -> Result<(), String> {
+        let actor_path = if parent_path.is_empty() {
+            actor.identifier.clone()
+        } else {
+            format!("{parent_path}/{}", actor.identifier)
+        };
+        let transform = parent_transform * source_transform(&actor.transform).to_matrix();
+        if let Some(model_name) = &actor.model {
+            let model = models.get(&key(model_name)).ok_or_else(|| {
+                format!("ACT actor {actor_path} references missing DAT model {model_name}")
+            })?;
+            let actor_material = actor
+                .material
+                .as_deref()
+                .map(|name| {
+                    materials.get(&key(name)).copied().ok_or_else(|| {
+                        format!("ACT actor {actor_path} references missing MAT {name}")
+                    })
+                })
+                .transpose()?;
+            let model_materials = model
+                .materials
+                .iter()
+                .map(|name| materials.get(&key(name)).copied())
+                .collect::<Vec<_>>();
+            let actor_id: Arc<str> = Arc::from(actor_path.as_str());
+            let model_id: Arc<str> = Arc::from(model.identifier.as_str());
+
+            for (face_index, face) in model.faces.iter().enumerate() {
+                let material = if actor_material.is_some() {
+                    actor_material
+                } else if face.material_index == 0 {
+                    None
+                } else {
+                    let material_index = usize::from(face.material_index) - 1;
+                    Some(
+                        model_materials
+                            .get(material_index)
+                            .and_then(|material| *material)
+                            .ok_or_else(|| {
+                                format!(
+                                    "DAT model {} face {face_index} references missing material index {}",
+                                    model.identifier, face.material_index
+                                )
+                            })?,
+                    )
+                };
+                let mut vertices = [[0.0; 3]; 3];
+                for (slot, index) in vertices.iter_mut().zip(face.vertices) {
+                    let vertex = model.vertices.get(usize::from(index)).ok_or_else(|| {
+                        format!(
+                            "DAT model {} face {face_index} has invalid vertex index {index}",
+                            model.identifier
+                        )
+                    })?;
+                    *slot = transform
+                        .transform_point3(Vec3::from_array(vertex.position))
+                        .to_array();
+                }
+                let source = SurfaceIdentity {
+                    actor_path: actor_id.clone(),
+                    model: model_id.clone(),
+                    face_index,
+                    material: material.map(|material| Arc::from(material.identifier.as_str())),
+                };
+                let two_sided = material
+                    .is_none_or(|material| material.two_sided() || material.always_visible());
+                world.add_triangle(vertices, face.flags, two_sided, source);
+            }
+        }
+
+        for child in &actor.children {
+            add_actor(child, transform, &actor_path, models, materials, world)?;
+        }
+        Ok(())
+    }
+
+    let mut world = StaticCollisionWorld::default();
+    for root in &track.scene.actor.roots {
+        add_actor(root, Mat4::IDENTITY, "", &models, &materials, &mut world)?;
+    }
+    Ok(world)
 }
 
 pub struct GalleryEntry {
@@ -431,7 +541,7 @@ impl VisualScene {
                     } else {
                         AlphaMode::Opaque
                     },
-                    cull_mode: if mat.two_sided() || mat.flags & 0x800 != 0 {
+                    cull_mode: if mat.two_sided() || mat.always_visible() {
                         None
                     } else {
                         Some(CullFace::Back)
@@ -675,6 +785,123 @@ mod tests {
         assert_eq!(
             pixelmap_to_image(&map, &colors).unwrap().data.unwrap(),
             [93, 3, 2, 255]
+        );
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::build_collision_world;
+    use dethrace_formats::{
+        act::{Actor, ActorTransform},
+        dat::{DatFile, Face, Model, Vertex},
+        mat::{MatFile, Material},
+        track_visual::TrackVisualSpec,
+    };
+
+    #[test]
+    fn collision_world_composes_actor_transforms_and_keeps_face_identity() {
+        let track = super::TrackSources {
+            spec: TrackVisualSpec {
+                track_file: "TRACK.TXT".into(),
+                start_position: [0.0; 3],
+                start_yaw_degrees: 0.0,
+                pixelmaps: vec![],
+                materials: vec![],
+                models: vec![],
+                actor_file: "TRACK.ACT".into(),
+            },
+            scene: super::VisualScene {
+                actor: dethrace_formats::act::ActFile {
+                    roots: vec![Actor {
+                        identifier: "ROOT".into(),
+                        actor_type: 0,
+                        render_style: 0,
+                        transform: ActorTransform::Translation([10.0, 0.0, 0.0]),
+                        model: None,
+                        material: None,
+                        bounds: None,
+                        children: vec![Actor {
+                            identifier: "ROAD".into(),
+                            actor_type: 1,
+                            render_style: 4,
+                            transform: ActorTransform::Translation([0.0, 2.0, 0.0]),
+                            model: Some("PLANE".into()),
+                            material: None,
+                            bounds: None,
+                            children: vec![],
+                        }],
+                    }],
+                },
+                pixelmaps: vec![],
+                materials: vec![MatFile {
+                    materials: vec![Material {
+                        identifier: "ROAD_MAT".into(),
+                        colour: [0; 3],
+                        opacity: 255,
+                        ambient: 0.0,
+                        diffuse: 0.0,
+                        specular: 0.0,
+                        power: 0.0,
+                        flags: 0x0800,
+                        map_transform: [[0.0; 2]; 3],
+                        index_base: 0,
+                        index_range: 0,
+                        colour_map: None,
+                        index_blend: None,
+                        index_shade: None,
+                        screendoor: None,
+                        index_fog: None,
+                    }],
+                }],
+                models: vec![DatFile {
+                    models: vec![Model {
+                        identifier: "PLANE".into(),
+                        flags: 0,
+                        pivot: None,
+                        crease_angle: None,
+                        radius: None,
+                        bounds: None,
+                        vertices: vec![
+                            Vertex {
+                                position: [0.0, 0.0, 0.0],
+                                uv: [0.0; 2],
+                            },
+                            Vertex {
+                                position: [1.0, 0.0, 0.0],
+                                uv: [0.0; 2],
+                            },
+                            Vertex {
+                                position: [0.0, 1.0, 0.0],
+                                uv: [0.0; 2],
+                            },
+                        ],
+                        faces: vec![Face {
+                            vertices: [0, 1, 2],
+                            smoothing: 0,
+                            flags: 0x80,
+                            material_index: 1,
+                        }],
+                        materials: vec!["ROAD_MAT".into()],
+                    }],
+                }],
+                palette: [[0; 3]; 256],
+            },
+        };
+        let world = build_collision_world(&track).unwrap();
+        let (hit, source) = world
+            .raycast_ground([10.2, 2.2, 1.0], [0.0, 0.0, -1.0], 2.0)
+            .unwrap();
+        assert_eq!(hit.point, [10.2, 2.2, 0.0]);
+        assert_eq!(hit.normal, [0.0, 0.0, 1.0]);
+        assert_eq!(source.actor_path.as_ref(), "ROOT/ROAD");
+        assert_eq!(source.model.as_ref(), "PLANE");
+        assert_eq!(source.face_index, 0);
+        assert_eq!(source.material.as_deref(), Some("ROAD_MAT"));
+        assert_eq!(world.triangles()[0].face_flags, 0x80);
+        assert_eq!(
+            world.bounds().unwrap(),
+            [[10.0, 2.0, 0.0], [11.0, 3.0, 0.0]]
         );
     }
 }

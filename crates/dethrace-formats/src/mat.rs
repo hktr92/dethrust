@@ -31,6 +31,10 @@ impl Material {
         self.flags & 0x1000 != 0
     }
 
+    pub fn always_visible(&self) -> bool {
+        self.flags & 0x0800 != 0
+    }
+
     pub fn prelit(&self) -> bool {
         self.flags & 2 != 0
     }
@@ -263,6 +267,7 @@ mod tests {
         assert_eq!(parsed.materials[0].colour, [255, 128, 0]);
         assert_eq!(parsed.materials[0].colour_map.as_deref(), Some("TEX.PIX"));
         assert!(parsed.materials[0].two_sided());
+        assert!(!parsed.materials[0].always_visible());
         assert!(parsed.materials[0].lit());
         for cut in [0, 7, 15, bytes.len() - 1] {
             assert!(MatFile::parse(&bytes[..cut]).is_err());

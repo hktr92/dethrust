@@ -2,4 +2,5 @@
 
 //! Domain types shared by the Dethrace rewrite.
 
+pub mod collision;
 pub mod vehicle;

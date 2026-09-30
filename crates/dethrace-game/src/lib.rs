@@ -1,9 +1,11 @@
-//! Static original-data scene inspection. Driving and simulation come later.
+//! Static original-data inspection; the M2 drive scene is assembled separately.
+
+pub mod collision;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use dethrace_assets::brender::TrackSources;
+use dethrace_assets::brender::{TrackSources, build_collision_world};
 
 #[derive(Resource)]
 pub struct TrackViewerSource(pub Option<TrackSources>);
@@ -19,8 +21,12 @@ pub struct TrackViewerPlugin;
 
 impl Plugin for TrackViewerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_track)
-            .add_systems(Update, inspect_track);
+        app.init_resource::<collision::CollisionDebugSettings>()
+            .add_systems(Startup, spawn_track)
+            .add_systems(
+                Update,
+                (inspect_track, toggle_collision_debug, draw_collision_debug).chain(),
+            );
     }
 }
 
@@ -32,6 +38,9 @@ fn spawn_track(
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let track = source.0.take().expect("track viewer source already used");
+    let collision = build_collision_world(&track)
+        .unwrap_or_else(|error| panic!("could not build Maim Street collision world: {error}"));
+    commands.insert_resource(collision::TrackCollisionWorld(collision));
     let start = Vec3::from_array(track.spec.start_position) + Vec3::Y * 3.0;
     let yaw = track.spec.start_yaw_degrees.to_radians();
     track
@@ -97,6 +106,51 @@ fn inspect_track(
     transform.translation += motion;
 }
 
+fn toggle_collision_debug(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut debug: ResMut<collision::CollisionDebugSettings>,
+) {
+    if keys.just_pressed(KeyCode::F3) {
+        debug.enabled = !debug.enabled;
+    }
+}
+
+fn draw_collision_debug(
+    world: Res<collision::TrackCollisionWorld>,
+    debug: Res<collision::CollisionDebugSettings>,
+    mut gizmos: Gizmos,
+) {
+    if !debug.enabled {
+        return;
+    }
+    let color = Color::srgb(1.0, 0.25, 0.05);
+    for triangle in world.0.triangles() {
+        for edge in 0..3 {
+            gizmos.line(
+                Vec3::from_array(triangle.vertices[edge]),
+                Vec3::from_array(triangle.vertices[(edge + 1) % 3]),
+                color,
+            );
+        }
+    }
+    if let Some(bounds) = world.0.bounds() {
+        let corners = std::array::from_fn::<_, 8, _>(|index| {
+            Vec3::new(
+                bounds[index & 1][0],
+                bounds[(index >> 1) & 1][1],
+                bounds[(index >> 2) & 1][2],
+            )
+        });
+        for index in 0..8 {
+            for axis in [1, 2, 4] {
+                if index & axis == 0 {
+                    gizmos.line(corners[index], corners[index | axis], Color::WHITE);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bevy::prelude::*;
@@ -105,5 +159,10 @@ mod tests {
     fn start_yaw_faces_positive_source_z() {
         let forward = Quat::from_rotation_y(180.0_f32.to_radians()) * -Vec3::Z;
         assert!((forward - Vec3::Z).length() < 1e-6);
+    }
+
+    #[test]
+    fn collision_debug_is_off_by_default() {
+        assert!(!super::collision::CollisionDebugSettings::default().enabled);
     }
 }
