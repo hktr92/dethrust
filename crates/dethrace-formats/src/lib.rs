@@ -11,3 +11,4 @@ pub mod game_text;
 pub mod image;
 pub mod mat;
 pub mod pix;
+pub mod race;
