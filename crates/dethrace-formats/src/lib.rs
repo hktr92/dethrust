@@ -12,3 +12,5 @@ pub mod image;
 pub mod mat;
 pub mod pix;
 pub mod race;
+
+pub mod track_visual;

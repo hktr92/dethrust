@@ -87,6 +87,21 @@ models/actors actually referenced by the chosen track presentation.
 provide the loading order. `world.c` later links the track actor's model names,
 processes columns, and mounts the hierarchy under the universe actor.
 
+The version-6 normal-resolution `CITYA1.TXT` dependency list resolved from
+`RACES.TXT` is:
+
+- PIX: `NYSKY1.PIX`, `CITYA2.PIX`, `NYHORIZN.PIX`, `DRKSCRN.PIX`, `FOGSCRN.PIX`
+- MAT: `GRIDDY.MAT`, `STADY.MAT`, `WATTY.MAT`, `NYSKY1.MAT`,
+  `CITYA2.MAT`, `DRKSCRN.MAT`, `FOGSCRN.MAT`, `SKIDMARK.MAT`
+- DAT: `CITYANW1.DAT`
+- ACT: `CITYANW1.ACT`
+
+The start position is `(159.94, -8.5, -225.67)` with yaw `180` degrees.
+`CITYA1X.ACT`/`.DAT` name an additional-object save path in `world.c`; their
+shipped files contain no static street geometry. The normal group above is the
+visual graph needed for the static viewer. Every named file exists in the
+supplied original installation.
+
 ## Source formats and scope
 
 | Input | Canonical loader | M1 subset | Deferred |
