@@ -5,15 +5,64 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
-use dethrace_assets::{FlicClip, GameDir};
+use dethrace_assets::{FlicClip, GameDir, brender::VisualScene};
 use dethrace_ui::{ButtonClip, MENU_CHOICES, MainMenuPlugin, MenuClips};
+
+#[derive(Resource)]
+struct DebugCarScene(Option<VisualScene>);
+
+fn spawn_debug_car(
+    mut commands: Commands,
+    mut scene: ResMut<DebugCarScene>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    let prepared = scene
+        .0
+        .take()
+        .expect("debug car scene already used")
+        .prepare(&mut images, &mut materials, &mut meshes)
+        .expect("could not prepare original car assets");
+    prepared
+        .spawn(&mut commands)
+        .expect("could not spawn original car actors");
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 0.0, 1.5).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+}
+
+fn run_debug_car(game_dir: &GameDir) -> Result<(), Box<dyn Error>> {
+    let scene = VisualScene::initial_car(game_dir)?;
+    App::new()
+        .insert_resource(DebugCarScene(Some(scene)))
+        .insert_resource(ClearColor(Color::srgb(0.08, 0.09, 0.12)))
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Carmageddon car visual".into(),
+                resolution: WindowResolution::new(960, 600),
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_systems(Startup, spawn_debug_car)
+        .run();
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    if args.len() != 2 || args[0] != OsStr::new("--game-dir") {
-        return Err("usage: dethrace-app --game-dir PATH".into());
+    if args.len() < 2 || args[0] != OsStr::new("--game-dir") {
+        return Err("usage: dethrace-app --game-dir PATH [--debug-scene car]".into());
     }
     let game_dir = GameDir::new(PathBuf::from(&args[1]))?;
+    if args.len() == 4 && args[2] == OsStr::new("--debug-scene") && args[3] == OsStr::new("car") {
+        return run_debug_car(&game_dir);
+    }
+    if args.len() != 2 {
+        return Err("usage: dethrace-app --game-dir PATH [--debug-scene car]".into());
+    }
     let path = game_dir.anim_path("MAI2STIL.FLI")?;
     let still_clip = FlicClip::load(&path, false)?;
     let still = still_clip

@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+pub mod brender;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageSampler};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -31,6 +33,38 @@ impl GameDir {
             return Err(format!("{} is missing ANIM/MAI2STIL.FLI", data.display()));
         }
         Ok(Self { data })
+    }
+
+    pub fn data_path(&self, relative: &str) -> Result<PathBuf, String> {
+        let path = Path::new(relative);
+        if path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!("invalid game data path: {relative}"));
+        }
+        Ok(self.data.join(path))
+    }
+
+    pub fn asset_path(&self, folder: &str, name: &str) -> Result<PathBuf, String> {
+        let file = Path::new(name);
+        if file.file_name() != Some(file.as_os_str()) || name.is_empty() {
+            return Err(format!("invalid asset filename: {name}"));
+        }
+        let folder_path = self.data_path(folder)?;
+        let entries = std::fs::read_dir(&folder_path)
+            .map_err(|e| format!("{}: {e}", folder_path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", folder_path.display()))?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name)
+            {
+                return Ok(entry.path());
+            }
+        }
+        Err(format!("{} is missing {name}", folder_path.display()))
     }
 
     pub fn anim_path(&self, name: &str) -> Result<PathBuf, String> {
@@ -129,6 +163,14 @@ mod tests {
             anim.join("MAI2COME.FLI")
         );
         assert!(dir.anim_path("../bad.FLI").is_err());
+        let pix = root.join("DATA/PIXELMAP");
+        std::fs::create_dir_all(&pix).unwrap();
+        std::fs::write(pix.join("EAGBLAK.PIX"), []).unwrap();
+        assert_eq!(
+            dir.asset_path("PIXELMAP", "eagblak.pix").unwrap(),
+            pix.join("EAGBLAK.PIX")
+        );
+        assert!(dir.asset_path("PIXELMAP", "../bad.PIX").is_err());
         let mut image = IndexedImage::new(2, 1).unwrap();
         image.pixels_mut().copy_from_slice(&[0, 1]);
         let mut palette = Palette256::default();

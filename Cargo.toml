@@ -18,4 +18,4 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.95"
 
 [workspace.dependencies]
-bevy = { version = "=0.19.1", default-features = false, features = ["2d"] }
+bevy = { version = "=0.19.1", default-features = false, features = ["2d", "3d"] }
