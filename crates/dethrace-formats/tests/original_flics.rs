@@ -12,12 +12,18 @@ fn decodes_original_fresh_boot_menu_flics() {
         game_dir.join("ANIM")
     };
     for name in [
+        "MAINSTIL.FLI",
         "MAI2STIL.FLI",
         "MAI2COME.FLI",
         "MAI2AWAY.FLI",
         "MAI2N1FL.FLI",
         "MAI2N1GL.FLI",
         "MAI2NNFL.FLI",
+        "MAI2NNGL.FLI",
+        "MAI2OPFL.FLI",
+        "MAI2OPGL.FLI",
+        "MAI2LDFL.FLI",
+        "MAI2LDGL.FLI",
         "MAI2QTFL.FLI",
         "MAI2QTGL.FLI",
     ] {
