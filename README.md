@@ -37,6 +37,19 @@ the `DATA` directory containing `ANIM`. Arrow keys or the gamepad D-pad move
 between choices; Enter, Space, a mouse click, or the gamepad South button
 selects. Escape or the gamepad East button opens Quit confirmation.
 
+## Inspect the Maim Street Damage Gallery
+
+```bash
+cargo run -p dethrace-app -- --game-dir "$CARMAGEDDON_DIR" --debug-scene damage-gallery-maim-street
+```
+
+The debug gallery loads the starting player car and five opponents resolved from
+Maim Street's original race and opponent data. Arrow keys or the gamepad D-pad
+select a car; Enter, Space, the gamepad South button, or a click zooms in.
+Drag with the mouse, or use WASD, to rotate the zoomed car. Escape, the gamepad
+East button, or Back zooms out and then exits; Done exits directly. Cars are
+visually intact: damage and crush simulation are outside Milestone 1.
+
 ## Inspect original FLICs
 
 The CLI tools use `dethrace-formats` directly and do not depend on Bevy. For a
