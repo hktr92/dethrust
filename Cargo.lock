@@ -2192,6 +2192,7 @@ name = "dethrace-ui"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "dethrace-assets",
 ]
 
 [[package]]
