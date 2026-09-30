@@ -221,3 +221,10 @@ Success means an untouched original Carmageddon installation can be passed to th
 For M0b, trace the **fresh boot / continue-not-allowed** path in upstream `mainmenu.c`. Do not guess which FLICs, menu layout, hover animations, or coordinates are used.
 
 No race loading or physics is part of Milestone 0.
+
+## Milestone 2+ simulation rules
+
+- Human, AI, replay, and network inputs feed one vehicle simulation through neutral DriverInput.
+- Run simulation on a fixed timestep and keep simulation separate from presentation.
+- Treat original game data as authoritative; use Dethrace as the behavior oracle, not as an architecture template.
+- Keep vehicle state and contacts inspectable through concise diagnostics.
