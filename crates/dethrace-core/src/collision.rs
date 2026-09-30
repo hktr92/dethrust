@@ -159,7 +159,11 @@ impl StaticCollisionWorld {
                 } else {
                     (triangle.normal, 0.0)
                 };
-                if depth > INTERSECTION_EPSILON {
+                // An overlap deeper than this sweep cannot be reached within this segment.
+                // Treating it as time zero would mask a nearer face the sweep actually crosses.
+                if depth > INTERSECTION_EPSILON
+                    && (!has_direction || depth <= max_distance + INTERSECTION_EPSILON)
+                {
                     let point = add(origin, scale(normal, depth));
                     if point_in_triangle(point, [a, b, c]) && depth > penetration {
                         closest = 0.0;
@@ -414,6 +418,27 @@ mod tests {
             Some("WALL")
         );
         assert_eq!(hit.normal, [-1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn chassis_sweep_prefers_near_crossing_over_distant_backface_overlap() {
+        let mut world = StaticCollisionWorld::default();
+        for x in [-10.0, 0.0] {
+            let a = [x, -10.0, -10.0];
+            let b = [x, 10.0, -10.0];
+            let c = [x, 10.0, 10.0];
+            let d = [x, -10.0, 10.0];
+            world.add_triangle([a, c, b], 0, false, source(Some("WALL")));
+            world.add_triangle([a, d, c], 0, false, source(Some("WALL")));
+        }
+
+        let hit = world
+            .raycast_chassis([-1.0, 0.0, 0.0], [2.0, 0.0, 0.0], 2.0)
+            .unwrap();
+        assert_eq!(hit.triangle_index, 2);
+        assert_eq!(hit.point, [0.0, 0.0, 0.0]);
+        assert_eq!(hit.distance, 1.0);
+        assert_eq!(hit.penetration, 0.0);
     }
 
     #[test]

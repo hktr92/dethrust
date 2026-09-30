@@ -203,16 +203,21 @@ impl VehicleState {
         if !self.is_finite() || !config.is_valid() {
             return false;
         }
-        chassis_support_points(self.position, self.orientation_xyzw, config)
-            .into_iter()
-            .all(|point| {
-                let source_point = point.map(|value| value / config.collision_world_scale);
-                world
-                    .raycast_chassis(source_point, [0.0; 3], 0.0)
-                    .is_none_or(|hit| {
-                        hit.penetration * config.collision_world_scale <= POSE_CLEARANCE_TOLERANCE
-                    })
-            })
+        let points = chassis_support_points(self.position, self.orientation_xyzw, config);
+        points.iter().all(|point| {
+            let source_point = point.map(|value| value / config.collision_world_scale);
+            world
+                .raycast_chassis(source_point, [0.0; 3], 0.0)
+                .is_none_or(|hit| {
+                    !support_points_span_face(
+                        &points,
+                        &points,
+                        world,
+                        hit.triangle_index,
+                        config.collision_world_scale,
+                    ) || hit.penetration * config.collision_world_scale <= POSE_CLEARANCE_TOLERANCE
+                })
+        })
     }
 }
 
@@ -573,6 +578,28 @@ fn resolve_chassis_motion(
     Ok(())
 }
 
+// A one-sided overlap is real only while the hull still reaches the face's front side.
+// Otherwise this point is behind an unrelated backface, not embedded in the triangle.
+fn support_points_span_face(
+    first: &[[f32; 3]],
+    second: &[[f32; 3]],
+    collision: &StaticCollisionWorld,
+    triangle_index: usize,
+    scale: f32,
+) -> bool {
+    let Some(triangle) = collision.triangles().get(triangle_index) else {
+        return false;
+    };
+    triangle.two_sided
+        || first.iter().chain(second).any(|point| {
+            let source_point = point.map(|value| value / scale);
+            dot(
+                subtract(source_point, triangle.vertices[0]),
+                triangle.normal,
+            ) >= -1.0e-4
+        })
+}
+
 fn sweep_chassis(
     from_position: [f32; 3],
     from_orientation: [f32; 4],
@@ -616,6 +643,17 @@ fn sweep_chassis(
             else {
                 continue;
             };
+            if hit.penetration > 0.0
+                && !support_points_span_face(
+                    &start_points,
+                    &end_points,
+                    collision,
+                    hit.triangle_index,
+                    config.collision_world_scale,
+                )
+            {
+                continue;
+            }
             if source_distance <= f32::EPSILON && hit.penetration <= f32::EPSILON {
                 continue;
             }
@@ -1098,7 +1136,7 @@ mod tests {
         world.add_triangle([a, c, d], 0, false, source);
         let config = vehicle_config();
         let embedded = VehicleState {
-            position: [-3.0, 0.0, 0.0],
+            position: [-1.0, 0.0, 0.0],
             ..VehicleState::default()
         };
         let clear = VehicleState {
@@ -1107,6 +1145,37 @@ mod tests {
         };
         assert!(!embedded.is_chassis_clear(&config, &world));
         assert!(clear.is_chassis_clear(&config, &world));
+    }
+
+    #[test]
+    fn ignores_one_sided_faces_wholly_behind_the_chassis() {
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        let wall = source("TEST/WALL", "WALL", 0);
+        let a = [0.0, -200.0, -200.0];
+        let b = [0.0, 200.0, -200.0];
+        let c = [0.0, 200.0, 200.0];
+        let d = [0.0, -200.0, 200.0];
+        world.add_triangle([a, c, b], 0, false, wall.clone());
+        world.add_triangle([a, d, c], 0, false, wall);
+
+        let behind = VehicleState {
+            position: [10.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        assert!(behind.is_chassis_clear(&config, &world));
+        let mut moving = VehicleState {
+            linear_velocity: [1.0, 0.0, 0.0],
+            ..behind
+        };
+        no_gravity_simulation(40)
+            .step_fixed(&mut moving, &config, DriverInput::default(), &world)
+            .unwrap();
+        assert!(moving.position[0] > behind.position[0]);
+        assert_eq!(moving.last_collision_triangle, None);
+
+        let straddling = VehicleState::default();
+        assert!(!straddling.is_chassis_clear(&config, &world));
     }
 
     #[test]
