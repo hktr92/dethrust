@@ -4,6 +4,7 @@
 
 pub mod act;
 pub mod binary;
+pub mod car_mechanics;
 pub mod car_visual;
 pub mod dat;
 pub mod flic;
