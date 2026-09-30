@@ -1,10 +1,10 @@
 # Dethrust
 
 Dethrust is a Rust and Bevy reimplementation of Carmageddon using game data
-supplied by the user. Milestone 0 is complete: the original fresh-boot menu
-renders and its five top-level choices respond to keyboard, mouse, and gamepad
-input. Destinations other than Quit currently show a temporary screen; race
-loading and physics are outside Milestone 0.
+supplied by the user. Milestone 0 provides the original fresh-boot menu and
+FLIC tooling. Milestone 1 adds an original-data Maim Street Damage Gallery and
+a static Maim Street viewer. Menu destinations other than Quit still show a
+temporary screen; driving and race gameplay are not implemented.
 
 ## Setup
 
@@ -50,6 +50,30 @@ Drag with the mouse, or use WASD, to rotate the zoomed car. Escape, the gamepad
 East button, or Back zooms out and then exits; Done exits directly. Cars are
 visually intact: damage and crush simulation are outside Milestone 1.
 
+## Inspect Maim Street
+
+```bash
+cargo run -p dethrace-app -- --game-dir "$CARMAGEDDON_DIR" --debug-scene maim-street
+```
+
+The viewer starts above the original Maim Street start position. Use WASD to
+move, Space/Q to rise or descend, hold Ctrl to move faster, and drag with the
+right mouse button to look around. Escape exits.
+
+## Milestone 1 scope and limits
+
+Both scenes load original PIX, MAT, DAT, and ACT data through the same checked
+parsers and Bevy asset bridge. The gallery resolves its five opponents from
+`RACES.TXT` and `OPPONENT.TXT` with a fixed inspection seed; the track viewer
+loads the normal-resolution Maim Street visual group and its referenced files.
+No original assets are stored in Git or needed from `.reference` at runtime.
+
+Rendering uses unlit source colors and textures. Exact palette shade tables,
+environment mapping, original sky/fog, animated materials, gallery button
+animations, and original font styling are deferred. Cars are undamaged. The
+track viewer has no collision, peds, AI, checkpoints as gameplay, or driving.
+The next milestone starts by placing a player car on Maim Street.
+
 ## Inspect original FLICs
 
 The CLI tools use `dethrace-formats` directly and do not depend on Bevy. For a
@@ -69,8 +93,9 @@ If the installation has `ANIM` at its root, remove `DATA/` from these paths.
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-CARMAGEDDON_DIR=/absolute/path/to/CARMA cargo test -p dethrace-formats --test original_flics -- --ignored
+CARMAGEDDON_DIR=/absolute/path/to/CARMA cargo test --workspace -- --ignored
 ```
 
 Normal workspace tests use synthetic data and do not require game assets. The
-last command decodes the original fresh-boot menu FLICs locally.
+last command validates original FLICs, BRender assets, the Maim Street car
+roster, and the track visual graph locally.
