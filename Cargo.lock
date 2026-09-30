@@ -2200,6 +2200,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "dethrace-assets",
+ "dethrace-game",
  "dethrace-ui",
 ]
 
@@ -2226,6 +2227,10 @@ version = "0.1.0"
 [[package]]
 name = "dethrace-game"
 version = "0.1.0"
+dependencies = [
+ "bevy",
+ "dethrace-assets",
+]
 
 [[package]]
 name = "dethrace-tools"
