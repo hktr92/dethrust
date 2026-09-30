@@ -201,6 +201,7 @@ fn simulate_player_vehicle(
 fn log_vehicle_telemetry(
     time: Res<Time>,
     vehicle: Res<PlayerVehicle>,
+    collision: Res<TrackCollisionWorld>,
     debug: Res<VehicleDebugSettings>,
     mut elapsed: Local<f32>,
 ) {
@@ -219,8 +220,20 @@ fn log_vehicle_telemetry(
     let compression = wheels.map(|wheel| (wheel.compression * 100.0).round() / 100.0);
     let loads = wheels.map(|wheel| (wheel.normal_load * 100.0).round() / 100.0);
     let normals = wheels.map(|wheel| wheel.contact_normal.map(|v| (v * 100.0).round() / 100.0));
+    let surface = vehicle
+        .state
+        .last_collision_triangle
+        .and_then(|index| collision.0.triangles().get(index))
+        .map(|triangle| {
+            (
+                triangle.source.actor_path.as_ref(),
+                triangle.source.model.as_ref(),
+                triangle.source.face_index,
+                triangle.source.material.as_deref(),
+            )
+        });
     bevy::log::info!(
-        "Vehicle gear {}, revs {:.0}, wheels {grounded}/4 ({slipping} slipping), compression {compression:?}, loads {loads:?}, normals {normals:?}, velocity {:?}, angular {:?}",
+        "Vehicle gear {}, revs {:.0}, wheels {grounded}/4 ({slipping} slipping), compression {compression:?}, loads {loads:?}, normals {normals:?}, collision surface {surface:?}, velocity {:?}, angular {:?}",
         vehicle.state.gear,
         vehicle.state.engine_revs,
         vehicle.state.linear_velocity,

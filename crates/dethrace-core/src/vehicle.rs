@@ -6,6 +6,14 @@ const MAX_STEPS_PER_UPDATE: u32 = 5;
 /// Upstream initializes each wheel ray to a two-mechanics-unit reach.
 const WHEEL_QUERY_DISTANCE: f32 = 2.0;
 const WHEEL_SWEEP_MARGIN: f32 = 0.5;
+const CHASSIS_SKIN: f32 = 0.002;
+const CHASSIS_FRICTION: f32 = 0.55;
+const CHASSIS_TOI_WINDOW: f32 = 0.01;
+// ponytail: four impacts cap per-step work; raise this if stacked track faces stall motion.
+const MAX_CHASSIS_CONTACT_ITERATIONS: usize = 4;
+const MAX_ANGULAR_SWEEP_SEGMENTS: usize = 16;
+const CHASSIS_SUPPORT_POINT_COUNT: usize = 14;
+const MAX_ANGULAR_SWEEP_STEP: f32 = 0.08726646;
 
 /// Controller-neutral normalized controls; mapping physical devices lives above core.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -159,6 +167,8 @@ pub struct VehicleState {
     pub gear: i32,
     pub engine_revs: f32,
     pub wheels: [WheelState; 4],
+    /// Last chassis hit's index in the active static collision world, for debug lookup.
+    pub last_collision_triangle: Option<usize>,
 }
 
 impl Default for VehicleState {
@@ -171,6 +181,7 @@ impl Default for VehicleState {
             gear: 0,
             engine_revs: 0.0,
             wheels: [WheelState::default(); 4],
+            last_collision_triangle: None,
         }
     }
 }
@@ -446,12 +457,320 @@ impl VehicleSimulation {
             *velocity += acceleration * dt;
         }
         integrate_orientation(&mut next.orientation_xyzw, next.angular_velocity, dt)?;
+        resolve_chassis_motion(state, &mut next, config, collision, dt)?;
         if !next.is_finite() {
             return Err(VehicleSimulationError::NonFiniteResult);
         }
         *state = next;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChassisContact {
+    fraction: f32,
+    point: [f32; 3],
+    normal: [f32; 3],
+    penetration: f32,
+    triangle_index: usize,
+}
+
+fn resolve_chassis_motion(
+    previous: &VehicleState,
+    next: &mut VehicleState,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+    dt: f32,
+) -> Result<(), VehicleSimulationError> {
+    let mut position = previous.position;
+    let mut orientation = previous.orientation_xyzw;
+    let mut remaining = dt;
+    let mut first_sweep = true;
+
+    for _ in 0..MAX_CHASSIS_CONTACT_ITERATIONS {
+        let target_position = if first_sweep {
+            next.position
+        } else {
+            add(position, scale(next.linear_velocity, remaining))
+        };
+        let target_orientation = if first_sweep {
+            next.orientation_xyzw
+        } else {
+            let mut target = orientation;
+            integrate_orientation(&mut target, next.angular_velocity, remaining)?;
+            target
+        };
+        let Some((fraction, contacts)) = sweep_chassis(
+            position,
+            orientation,
+            target_position,
+            target_orientation,
+            config,
+            collision,
+        ) else {
+            next.position = target_position;
+            next.orientation_xyzw = target_orientation;
+            return Ok(());
+        };
+        position = lerp3(position, target_position, fraction);
+        orientation = interpolate_orientation(orientation, target_orientation, fraction);
+        next.position = position;
+        next.orientation_xyzw = orientation;
+
+        let mut corrections: Vec<([f32; 3], f32)> = Vec::new();
+        for contact in &contacts {
+            if let Some((_, depth)) = corrections
+                .iter_mut()
+                .find(|(normal, _)| dot(*normal, contact.normal) > 0.99)
+            {
+                *depth = depth.max(contact.penetration);
+            } else {
+                corrections.push((contact.normal, contact.penetration));
+            }
+        }
+        for (normal, penetration) in corrections {
+            position = add(position, scale(normal, penetration + CHASSIS_SKIN));
+        }
+        next.position = position;
+
+        for _ in 0..2 {
+            for contact in &contacts {
+                apply_chassis_impulse(next, config, contact.point, contact.normal);
+                next.last_collision_triangle = Some(contact.triangle_index);
+            }
+        }
+
+        remaining *= 1.0 - fraction;
+        first_sweep = false;
+        if remaining <= f32::EPSILON {
+            next.position = position;
+            next.orientation_xyzw = orientation;
+            return Ok(());
+        }
+    }
+
+    // Stop this fixed step at the last safe contact if several surfaces consume the solver budget.
+    next.position = position;
+    next.orientation_xyzw = orientation;
+    Ok(())
+}
+
+fn sweep_chassis(
+    from_position: [f32; 3],
+    from_orientation: [f32; 4],
+    to_position: [f32; 3],
+    to_orientation: [f32; 4],
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+) -> Option<(f32, Vec<ChassisContact>)> {
+    let rotation_dot = from_orientation
+        .iter()
+        .zip(to_orientation)
+        .map(|(from, to)| from * to)
+        .sum::<f32>()
+        .abs()
+        .clamp(-1.0, 1.0);
+    let angle = 2.0 * rotation_dot.acos();
+    let segments = (angle / MAX_ANGULAR_SWEEP_STEP)
+        .ceil()
+        .clamp(1.0, MAX_ANGULAR_SWEEP_SEGMENTS as f32) as usize;
+    let mut earliest = f32::INFINITY;
+    let mut contacts = Vec::new();
+
+    for segment in 0..segments {
+        let segment_start = segment as f32 / segments as f32;
+        let segment_end = (segment + 1) as f32 / segments as f32;
+        let start_position = lerp3(from_position, to_position, segment_start);
+        let end_position = lerp3(from_position, to_position, segment_end);
+        let start_orientation =
+            interpolate_orientation(from_orientation, to_orientation, segment_start);
+        let end_orientation =
+            interpolate_orientation(from_orientation, to_orientation, segment_end);
+        let start_points = chassis_support_points(start_position, start_orientation, config);
+        let end_points = chassis_support_points(end_position, end_orientation, config);
+
+        for (start, end) in start_points.into_iter().zip(end_points) {
+            let source_start = start.map(|value| value / config.collision_world_scale);
+            let source_delta =
+                subtract(end, start).map(|value| value / config.collision_world_scale);
+            let source_distance = dot(source_delta, source_delta).sqrt();
+            let Some(hit) = collision.raycast_chassis(source_start, source_delta, source_distance)
+            else {
+                continue;
+            };
+            if source_distance <= f32::EPSILON && hit.penetration <= f32::EPSILON {
+                continue;
+            }
+            let local_fraction = if source_distance <= f32::EPSILON {
+                0.0
+            } else {
+                (hit.distance / source_distance).clamp(0.0, 1.0)
+            };
+            let fraction = (segment as f32 + local_fraction) / segments as f32;
+            if fraction < earliest - CHASSIS_TOI_WINDOW {
+                contacts.clear();
+                earliest = fraction;
+            } else if fraction < earliest {
+                earliest = fraction;
+                contacts.retain(|contact: &ChassisContact| {
+                    contact.fraction <= earliest + CHASSIS_TOI_WINDOW
+                });
+            }
+            let point = hit.point.map(|value| value * config.collision_world_scale);
+            if fraction <= earliest + CHASSIS_TOI_WINDOW
+                && !contacts.iter().any(|contact| {
+                    let separation = subtract(contact.point, point);
+                    dot(contact.normal, hit.normal) > 0.99 && dot(separation, separation) < 1.0e-4
+                })
+            {
+                contacts.push(ChassisContact {
+                    fraction,
+                    point,
+                    normal: hit.normal,
+                    penetration: hit.penetration * config.collision_world_scale,
+                    triangle_index: hit.triangle_index,
+                });
+            }
+        }
+    }
+    (!contacts.is_empty()).then_some((earliest.clamp(0.0, 1.0), contacts))
+}
+
+fn chassis_corners(
+    position: [f32; 3],
+    orientation: [f32; 4],
+    config: &VehicleConfig,
+) -> [[f32; 3]; 8] {
+    std::array::from_fn(|index| {
+        let local = std::array::from_fn(|axis| {
+            let bound = if index & (1 << axis) == 0 { 0 } else { 1 };
+            config.bounds[bound][axis] - config.center_of_mass[axis]
+        });
+        add(position, rotate(orientation, local))
+    })
+}
+
+fn chassis_support_points(
+    position: [f32; 3],
+    orientation: [f32; 4],
+    config: &VehicleConfig,
+) -> [[f32; 3]; CHASSIS_SUPPORT_POINT_COUNT] {
+    // ponytail: corners and face centers can miss small edge-only obstacles; add edge centers if track tests expose them.
+    let corners = chassis_corners(position, orientation, config);
+    let center: [f32; 3] =
+        std::array::from_fn(|axis| (config.bounds[0][axis] + config.bounds[1][axis]) * 0.5);
+    std::array::from_fn(|index| {
+        if index < corners.len() {
+            return corners[index];
+        }
+        let face = index - corners.len();
+        let axis = face / 2;
+        let bound = face % 2;
+        let local = std::array::from_fn(|component| {
+            let value = if component == axis {
+                config.bounds[bound][component]
+            } else {
+                center[component]
+            };
+            value - config.center_of_mass[component]
+        });
+        add(position, rotate(orientation, local))
+    })
+}
+
+fn apply_chassis_impulse(
+    state: &mut VehicleState,
+    config: &VehicleConfig,
+    point: [f32; 3],
+    normal: [f32; 3],
+) {
+    let lever = subtract(point, state.position);
+    let point_velocity = add(state.linear_velocity, cross(state.angular_velocity, lever));
+    let inward_speed = dot(point_velocity, normal);
+    if inward_speed >= 0.0 {
+        return;
+    }
+    let normal_moment = cross(lever, normal);
+    let normal_denominator = 1.0 / config.mass
+        + dot(
+            normal_moment,
+            inverse_inertia_world(state.orientation_xyzw, config, normal_moment),
+        );
+    if normal_denominator <= f32::EPSILON || !normal_denominator.is_finite() {
+        return;
+    }
+    let normal_impulse = -inward_speed / normal_denominator;
+    apply_impulse(state, config, lever, scale(normal, normal_impulse));
+
+    let point_velocity = add(state.linear_velocity, cross(state.angular_velocity, lever));
+    let tangent = subtract(point_velocity, scale(normal, dot(point_velocity, normal)));
+    let tangent_speed = dot(tangent, tangent).sqrt();
+    if tangent_speed <= f32::EPSILON {
+        return;
+    }
+    let tangent_direction = scale(tangent, tangent_speed.recip());
+    let tangent_moment = cross(lever, tangent_direction);
+    let tangent_denominator = 1.0 / config.mass
+        + dot(
+            tangent_moment,
+            inverse_inertia_world(state.orientation_xyzw, config, tangent_moment),
+        );
+    if tangent_denominator <= f32::EPSILON || !tangent_denominator.is_finite() {
+        return;
+    }
+    let friction_impulse =
+        (tangent_speed / tangent_denominator).min(CHASSIS_FRICTION * normal_impulse);
+    apply_impulse(
+        state,
+        config,
+        lever,
+        scale(tangent_direction, -friction_impulse),
+    );
+}
+
+fn apply_impulse(
+    state: &mut VehicleState,
+    config: &VehicleConfig,
+    lever: [f32; 3],
+    impulse: [f32; 3],
+) {
+    state.linear_velocity = add(state.linear_velocity, scale(impulse, 1.0 / config.mass));
+    let angular_impulse = cross(lever, impulse);
+    state.angular_velocity = add(
+        state.angular_velocity,
+        inverse_inertia_world(state.orientation_xyzw, config, angular_impulse),
+    );
+}
+
+fn inverse_inertia_world(
+    orientation: [f32; 4],
+    config: &VehicleConfig,
+    vector: [f32; 3],
+) -> [f32; 3] {
+    let local = inverse_rotate(orientation, vector);
+    rotate(
+        orientation,
+        std::array::from_fn(|axis| local[axis] / config.principal_inertia[axis]),
+    )
+}
+
+fn interpolate_orientation(from: [f32; 4], mut to: [f32; 4], fraction: f32) -> [f32; 4] {
+    let dot = from.iter().zip(to).map(|(a, b)| a * b).sum::<f32>();
+    if dot < 0.0 {
+        to = to.map(|value| -value);
+    }
+    let mut result =
+        std::array::from_fn(|index| from[index] + (to[index] - from[index]) * fraction);
+    let length_squared = result.iter().map(|value| value * value).sum::<f32>();
+    if length_squared > f32::MIN_POSITIVE {
+        let inverse_length = length_squared.sqrt().recip();
+        result.iter_mut().for_each(|value| *value *= inverse_length);
+    }
+    result
+}
+
+fn lerp3(from: [f32; 3], to: [f32; 3], fraction: f32) -> [f32; 3] {
+    add(from, scale(subtract(to, from), fraction))
 }
 
 fn drivetrain(
@@ -608,7 +927,7 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::{
         DriverInput, VehicleConfig, VehicleSimulation, VehicleSimulationError,
-        VehicleSimulationSettings, VehicleState,
+        VehicleSimulationSettings, VehicleState, chassis_corners,
     };
     use crate::collision::{StaticCollisionWorld, SurfaceIdentity};
     use std::{sync::Arc, time::Duration};
@@ -675,6 +994,220 @@ mod tests {
 
     fn flat_ground() -> StaticCollisionWorld {
         ground(-10.0, 10.0, -10.0, 10.0)
+    }
+
+    fn source(actor: &'static str, model: &'static str, face_index: usize) -> SurfaceIdentity {
+        SurfaceIdentity {
+            actor_path: Arc::from(actor),
+            model: Arc::from(model),
+            face_index,
+            material: Some(Arc::from("WALL")),
+        }
+    }
+
+    fn add_wall_x(
+        world: &mut StaticCollisionWorld,
+        x: f32,
+        min_y: f32,
+        max_y: f32,
+        min_z: f32,
+        max_z: f32,
+    ) {
+        let a = [x, min_y, min_z];
+        let b = [x, max_y, min_z];
+        let c = [x, max_y, max_z];
+        let d = [x, min_y, max_z];
+        world.add_triangle([a, c, b], 0, true, source("TEST/WALL_X", "WALL_X", 0));
+        world.add_triangle([a, d, c], 0, true, source("TEST/WALL_X", "WALL_X", 1));
+    }
+
+    fn add_wall_z(
+        world: &mut StaticCollisionWorld,
+        z: f32,
+        min_x: f32,
+        max_x: f32,
+        min_y: f32,
+        max_y: f32,
+    ) {
+        let a = [min_x, min_y, z];
+        let b = [max_x, min_y, z];
+        let c = [max_x, max_y, z];
+        let d = [min_x, max_y, z];
+        world.add_triangle([a, b, c], 0, true, source("TEST/WALL_Z", "WALL_Z", 0));
+        world.add_triangle([a, c, d], 0, true, source("TEST/WALL_Z", "WALL_Z", 1));
+    }
+
+    fn no_gravity_simulation(step_ms: u64) -> VehicleSimulation {
+        VehicleSimulation::new(VehicleSimulationSettings {
+            fixed_step: Duration::from_millis(step_ms),
+            gravity: [0.0; 3],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn chassis_floor_impact_stops_before_crossing_and_keeps_surface_identity() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut state = VehicleState {
+            position: [0.0, 5.0, 0.0],
+            linear_velocity: [0.0, -60.0, 0.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &flat_ground())
+            .unwrap();
+        let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+        assert!(corners.iter().all(|corner| corner[1] >= -0.01), "{state:?}");
+        assert!(state.linear_velocity[1] > -60.0, "{state:?}");
+        assert!(state.last_collision_triangle.is_some());
+    }
+
+    #[test]
+    fn chassis_face_center_hits_a_narrow_floor_patch() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut state = VehicleState {
+            position: [0.0, 5.0, 0.0],
+            linear_velocity: [0.0, -60.0, 0.0],
+            ..VehicleState::default()
+        };
+        let patch = ground(-1.0, 1.0, -1.0, 1.0);
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &patch)
+            .unwrap();
+        assert!(state.last_collision_triangle.is_some());
+        assert!(state.position[1] >= -0.01, "{state:?}");
+        assert!(state.is_finite());
+    }
+
+    #[test]
+    fn chassis_wall_impact_has_angular_response_and_surface_identity() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        let mut state = VehicleState {
+            position: [-8.0, 10.0, 0.0],
+            linear_velocity: [100.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &world)
+            .unwrap();
+        let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+        assert!(corners.iter().all(|corner| corner[0] <= 0.01), "{state:?}");
+        assert!(state.linear_velocity[0] < 20.0, "{state:?}");
+        assert!(
+            state
+                .angular_velocity
+                .iter()
+                .any(|value| value.abs() > 0.01)
+        );
+        let triangle = &world.triangles()[state.last_collision_triangle.unwrap()];
+        assert_eq!(triangle.source.model.as_ref(), "WALL_X");
+    }
+
+    #[test]
+    fn glancing_chassis_contact_keeps_tangent_motion() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        let mut state = VehicleState {
+            position: [-8.0, 10.0, 0.0],
+            linear_velocity: [100.0, 0.0, -10.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &world)
+            .unwrap();
+        assert!(state.linear_velocity[0] < 20.0, "{state:?}");
+        assert!(state.linear_velocity[2] < -1.0, "{state:?}");
+        assert!(state.is_finite());
+    }
+
+    #[test]
+    fn simultaneous_corner_contacts_stop_motion_into_both_walls() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        add_wall_z(&mut world, 0.0, -20.0, 20.0, 0.0, 30.0);
+        let mut state = VehicleState {
+            position: [-7.0, 10.0, -7.0],
+            linear_velocity: [50.0, 0.0, 40.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &world)
+            .unwrap();
+        let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+        assert!(corners.iter().all(|corner| corner[0] <= 0.01), "{state:?}");
+        assert!(corners.iter().all(|corner| corner[2] <= 0.01), "{state:?}");
+        assert!(state.is_finite());
+    }
+
+    #[test]
+    fn chassis_can_rest_next_to_a_wall_after_impact() {
+        let simulation = no_gravity_simulation(40);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        let mut state = VehicleState {
+            position: [-2.1, 10.0, 0.0],
+            linear_velocity: [5.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        for _ in 0..100 {
+            simulation
+                .step_fixed(&mut state, &config, DriverInput::default(), &world)
+                .unwrap();
+            assert!(state.is_finite());
+        }
+        let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+        assert!(corners.iter().all(|corner| corner[0] <= 0.02), "{state:?}");
+        assert!(state.linear_velocity[0].abs() < 0.1, "{state:?}");
+    }
+
+    #[test]
+    fn high_speed_chassis_sweep_does_not_tunnel_through_a_wall() {
+        let simulation = no_gravity_simulation(100);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        let mut state = VehicleState {
+            position: [-10.0, 10.0, 0.0],
+            linear_velocity: [250.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        simulation
+            .step_fixed(&mut state, &config, DriverInput::default(), &world)
+            .unwrap();
+        let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+        assert!(corners.iter().all(|corner| corner[0] <= 0.02), "{state:?}");
+        assert!(state.is_finite());
+    }
+
+    #[test]
+    fn repeated_wall_contacts_remain_finite_and_nonpenetrating() {
+        let simulation = no_gravity_simulation(40);
+        let config = vehicle_config();
+        let mut world = StaticCollisionWorld::default();
+        add_wall_x(&mut world, 0.0, 0.0, 30.0, -20.0, 20.0);
+        let mut state = VehicleState {
+            position: [-2.1, 10.0, 0.0],
+            ..VehicleState::default()
+        };
+        for _ in 0..500 {
+            state.linear_velocity[0] = 1.0;
+            simulation
+                .step_fixed(&mut state, &config, DriverInput::default(), &world)
+                .unwrap();
+            assert!(state.is_finite(), "{state:?}");
+            let corners = chassis_corners(state.position, state.orientation_xyzw, &config);
+            assert!(corners.iter().all(|corner| corner[0] <= 0.03), "{state:?}");
+        }
     }
 
     #[test]
@@ -1016,6 +1549,7 @@ mod tests {
         assert!(spring_state.linear_velocity[1] > -0.4);
 
         let mut damped_state = VehicleState {
+            position: [0.0, 0.2, 0.0],
             linear_velocity: [0.0, -1.0, 0.0],
             ..VehicleState::default()
         };
