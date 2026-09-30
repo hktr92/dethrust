@@ -31,11 +31,32 @@ pub struct GalleryCar {
     pub index: usize,
 }
 
+#[derive(Component)]
+struct GallerySpin {
+    automatic: bool,
+    angle_degrees: f64,
+}
+
 pub struct DamageGalleryPlugin;
 
 impl Plugin for DamageGalleryPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, show_gallery);
+        app.add_systems(Update, spin_gallery);
+    }
+}
+
+fn advance_spin(transform: &mut Transform, spin: &mut GallerySpin, seconds: f64) {
+    if spin.automatic {
+        // SpinWrecks uses 0.05 degrees per millisecond.
+        spin.angle_degrees = (spin.angle_degrees + seconds * 50.0).rem_euclid(360.0);
+        transform.rotation = Quat::from_rotation_y(spin.angle_degrees.to_radians() as f32);
+    }
+}
+
+fn spin_gallery(time: Res<Time>, mut cars: Query<(&mut Transform, &mut GallerySpin)>) {
+    for (mut transform, mut spin) in &mut cars {
+        advance_spin(&mut transform, &mut spin, time.delta_secs_f64());
     }
 }
 
@@ -148,6 +169,10 @@ fn show_gallery(
         let car = commands
             .spawn((
                 GalleryCar { index },
+                GallerySpin {
+                    automatic: true,
+                    angle_degrees: 0.0,
+                },
                 gallery_car_transform(index, entry.radius).expect("validated radius"),
             ))
             .id();
@@ -179,7 +204,7 @@ fn show_gallery(
 
 #[cfg(test)]
 mod tests {
-    use super::gallery_car_transform;
+    use super::{GallerySpin, advance_spin, gallery_car_transform};
     use bevy::prelude::Vec3;
     #[test]
     fn uses_original_three_column_layout_and_radius() {
@@ -196,5 +221,28 @@ mod tests {
             Vec3::splat(0.5)
         );
         assert!(gallery_car_transform(0, 0.0).is_err());
+    }
+
+    #[test]
+    fn spin_matches_elapsed_time_without_transform_drift() {
+        let initial = gallery_car_transform(5, 0.94).unwrap();
+        for steps in [10, 60, 240] {
+            let mut transform = initial;
+            let mut spin = GallerySpin {
+                automatic: true,
+                angle_degrees: 0.0,
+            };
+            for _ in 0..steps {
+                advance_spin(&mut transform, &mut spin, 1.0 / f64::from(steps));
+            }
+            assert!((spin.angle_degrees - 50.0).abs() < 1e-9);
+            assert_eq!(transform.translation, initial.translation);
+            assert_eq!(transform.scale, initial.scale);
+            assert!((transform.rotation.length() - 1.0).abs() < 1e-6);
+            spin.automatic = false;
+            let rotation = transform.rotation;
+            advance_spin(&mut transform, &mut spin, 1.0);
+            assert_eq!(transform.rotation, rotation);
+        }
     }
 }
