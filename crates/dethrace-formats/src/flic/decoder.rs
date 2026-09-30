@@ -23,6 +23,11 @@ pub enum FlicDecodeErrorKind {
         count: usize,
         width: usize,
     },
+    LineOverflow {
+        start: usize,
+        count: usize,
+        height: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +109,8 @@ impl<'flic, 'bytes> FlicDecoder<'flic, 'bytes> {
             let result = match chunk.chunk_type {
                 4 | 11 => decode_palette(&mut palette, chunk.payload, chunk.chunk_type == 11),
                 15 => decode_byte_run(&mut image, chunk.payload),
+                7 => decode_delta(&mut image, chunk.payload),
+                12 => decode_difference(&mut image, chunk.payload),
                 13 => {
                     image.pixels_mut().fill(0);
                     Ok(())
@@ -223,6 +230,131 @@ fn decode_byte_run(image: &mut IndexedImage, bytes: &[u8]) -> Result<(), FlicDec
     Ok(())
 }
 
+fn row_range(
+    row: usize,
+    start: usize,
+    count: usize,
+    width: usize,
+) -> Result<std::ops::Range<usize>, FlicDecodeErrorKind> {
+    let end = start
+        .checked_add(count)
+        .ok_or(FlicDecodeErrorKind::RowOverflow {
+            row,
+            start,
+            count,
+            width,
+        })?;
+    if end > width {
+        return Err(FlicDecodeErrorKind::RowOverflow {
+            row,
+            start,
+            count,
+            width,
+        });
+    }
+    Ok(start..end)
+}
+
+fn decode_difference(image: &mut IndexedImage, bytes: &[u8]) -> Result<(), FlicDecodeErrorKind> {
+    let mut reader = BinaryReader::new(bytes);
+    let first = usize::from(reader.read_u16_le().map_err(FlicDecodeErrorKind::Read)?);
+    let count = usize::from(reader.read_u16_le().map_err(FlicDecodeErrorKind::Read)?);
+    let end = first
+        .checked_add(count)
+        .ok_or(FlicDecodeErrorKind::LineOverflow {
+            start: first,
+            count,
+            height: image.height(),
+        })?;
+    if end > image.height() {
+        return Err(FlicDecodeErrorKind::LineOverflow {
+            start: first,
+            count,
+            height: image.height(),
+        });
+    }
+    let width = image.width();
+    for y in first..end {
+        let packets = reader.read_u8().map_err(FlicDecodeErrorKind::Read)?;
+        let row = image.row_mut(y).expect("validated row range");
+        let mut x = 0usize;
+        for _ in 0..packets {
+            let skip = usize::from(reader.read_u8().map_err(FlicDecodeErrorKind::Read)?);
+            x = row_range(y, x, skip, width)?.end;
+            let count = reader.read_i8().map_err(FlicDecodeErrorKind::Read)?;
+            let len = usize::from(count.unsigned_abs());
+            let range = row_range(y, x, len, width)?;
+            if count >= 0 {
+                row[range.clone()]
+                    .copy_from_slice(reader.take(len).map_err(FlicDecodeErrorKind::Read)?);
+            } else {
+                row[range.clone()].fill(reader.read_u8().map_err(FlicDecodeErrorKind::Read)?);
+            }
+            x = range.end;
+        }
+    }
+    Ok(())
+}
+
+fn decode_delta(image: &mut IndexedImage, bytes: &[u8]) -> Result<(), FlicDecodeErrorKind> {
+    let mut reader = BinaryReader::new(bytes);
+    let line_count = usize::from(reader.read_u16_le().map_err(FlicDecodeErrorKind::Read)?);
+    let mut y = 0usize;
+    let mut decoded = 0usize;
+    let width = image.width();
+    while decoded < line_count {
+        let packets = reader.read_i16_le().map_err(FlicDecodeErrorKind::Read)?;
+        if packets < 0 {
+            let skip = usize::from(packets.unsigned_abs());
+            let end = y
+                .checked_add(skip)
+                .ok_or(FlicDecodeErrorKind::LineOverflow {
+                    start: y,
+                    count: skip,
+                    height: image.height(),
+                })?;
+            if end >= image.height() {
+                return Err(FlicDecodeErrorKind::LineOverflow {
+                    start: y,
+                    count: skip,
+                    height: image.height(),
+                });
+            }
+            y = end;
+            continue;
+        }
+        if y >= image.height() {
+            return Err(FlicDecodeErrorKind::LineOverflow {
+                start: y,
+                count: 1,
+                height: image.height(),
+            });
+        }
+        let row = image.row_mut(y).expect("validated row index");
+        let mut x = 0usize;
+        for _ in 0..packets {
+            let skip = usize::from(reader.read_u8().map_err(FlicDecodeErrorKind::Read)?);
+            x = row_range(y, x, skip, width)?.end;
+            let count = reader.read_i8().map_err(FlicDecodeErrorKind::Read)?;
+            let byte_len = usize::from(count.unsigned_abs()) * 2;
+            let range = row_range(y, x, byte_len, width)?;
+            if count >= 0 {
+                row[range.clone()]
+                    .copy_from_slice(reader.take(byte_len).map_err(FlicDecodeErrorKind::Read)?);
+            } else {
+                let word = reader.take(2).map_err(FlicDecodeErrorKind::Read)?;
+                for pair in row[range.clone()].chunks_exact_mut(2) {
+                    pair.copy_from_slice(word);
+                }
+            }
+            x = range.end;
+        }
+        y += 1;
+        decoded += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +423,53 @@ mod tests {
             let flic = decode(vec![chunk(kind, &payload)]);
             let mut decoder = FlicDecoder::new(&flic).unwrap();
             assert!(decoder.decode_next_frame().is_err());
+            assert_eq!(decoder.frame_position(), 0);
+            assert_eq!(decoder.image().pixels(), &[0; 8]);
+        }
+    }
+
+    #[test]
+    fn delta_skips_line_and_updates_words_without_touching_other_pixels() {
+        let copy = [1, 2, 3, 4, 5, 6, 7, 8];
+        let delta = [1, 0, 255, 255, 1, 0, 0, 2, 5, 6, 7, 8];
+        let flic = decode(vec![chunk(16, &copy), chunk(7, &delta)]);
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+        decoder.decode_next_frame().unwrap();
+        assert_eq!(decoder.image().pixels(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn difference_first_line_and_repeated_packet_preserve_gaps() {
+        let copy = [1, 2, 3, 4, 5, 6, 7, 8];
+        let difference = [1, 0, 1, 0, 2, 0, 2, 9, 10, 1, 255, 11];
+        let flic = decode(vec![chunk(16, &copy), chunk(12, &difference)]);
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+        decoder.decode_next_frame().unwrap();
+        assert_eq!(decoder.image().pixels(), &[1, 2, 3, 4, 9, 10, 7, 11]);
+    }
+
+    #[test]
+    fn delta_repeats_words_and_rejects_truncation_or_overflow() {
+        let repeated = [1, 0, 1, 0, 0, 254, 9, 10];
+        let flic = decode(vec![chunk(7, &repeated)]);
+        let mut decoder = FlicDecoder::new(&flic).unwrap();
+        decoder.decode_next_frame().unwrap();
+        assert_eq!(decoder.image().pixels(), &[9, 10, 9, 10, 0, 0, 0, 0]);
+
+        for (kind, payload) in [
+            (7, vec![1, 0, 254, 255]),
+            (7, vec![1, 0, 1, 0, 4, 1, 1, 2]),
+            (7, vec![1, 0, 1, 0, 0, 1, 1]),
+            (12, vec![2, 0, 1, 0]),
+            (12, vec![0, 0, 1, 0, 1, 3, 2, 1, 2]),
+            (12, vec![0, 0, 1, 0, 1, 0, 2, 1]),
+        ] {
+            let flic = decode(vec![chunk(kind, &payload)]);
+            let mut decoder = FlicDecoder::new(&flic).unwrap();
+            assert!(
+                decoder.decode_next_frame().is_err(),
+                "kind {kind}, payload {payload:?}"
+            );
             assert_eq!(decoder.frame_position(), 0);
             assert_eq!(decoder.image().pixels(), &[0; 8]);
         }
