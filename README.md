@@ -3,8 +3,9 @@
 Dethrust is a Rust and Bevy reimplementation of Carmageddon using game data
 supplied by the user. Milestone 0 provides the original fresh-boot menu and
 FLIC tooling. Milestone 1 adds an original-data Maim Street Damage Gallery and
-a static Maim Street viewer. Menu destinations other than Quit still show a
-temporary screen; driving and race gameplay are not implemented.
+a static Maim Street viewer. Milestone 2 adds a fixed-step, drivable player car
+on Maim Street. Menu destinations other than Quit still show a temporary screen;
+full race gameplay is not implemented.
 
 ## Setup
 
@@ -71,8 +72,45 @@ No original assets are stored in Git or needed from `.reference` at runtime.
 Rendering uses unlit source colors and textures. Exact palette shade tables,
 environment mapping, original sky/fog, animated materials, gallery button
 animations, and original font styling are deferred. Cars are undamaged. The
-track viewer has no collision, peds, AI, checkpoints as gameplay, or driving.
-The next milestone starts by placing a player car on Maim Street.
+static track viewer has no collision, peds, AI, checkpoints as gameplay, or
+driving.
+
+## Drive Maim Street (Milestone 2)
+
+```bash
+cargo run -p dethrace-app -- --game-dir "$CARMAGEDDON_DIR" --debug-scene maim-street-drive
+```
+
+The drive scene loads Maim Street, the original starting BLKEAGLE, and the
+original start transform. It settles the car on four wheel contacts, simulates
+at a fixed 25 Hz, collides with the parsed static track, and follows it with a
+chase camera.
+
+| Action | Keyboard | Xbox-style gamepad |
+| --- | --- | --- |
+| Accelerate | W / Up | A button or RT |
+| Steer | A / D or Left / Right | Left stick or D-pad |
+| Brake / reverse | S / Down | X button or LT |
+| Handbrake | Space | B button |
+| Recover / reset | R | Start |
+
+At very low speed, holding brake selects reverse. F1 logs `DriverInput` changes
+to the terminal. F2 enables once-per-second vehicle and recovery telemetry and
+wheel contact markers; the log includes pose, speed, velocities, gear, wheel
+contacts and slip, fixed-step rate, last collision surface, and recovery state.
+
+The vehicle simulation is Dethrust-owned and separate from Bevy transforms. The
+current model uses parsed mechanics with four suspension contacts and a sampled
+14-point chassis sweep. Tyre response is simplified: there is no
+material-specific grip or speed downforce, no engine-inertia model, and no
+dynamic car-to-car collision. See
+[docs/m2-vehicle-simulation.md](docs/m2-vehicle-simulation.md) for handling
+traces and the differences from Dethrace. Opponents, race progression, damage,
+HUD, and audio remain out of scope.
+
+## Next milestone
+
+The next milestone is **track semantics**, not opponents.
 
 ## Inspect original FLICs
 
