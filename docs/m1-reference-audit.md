@@ -95,10 +95,12 @@ The version-6 normal-resolution `CITYA1.TXT` dependency list resolved from
   `CITYA2.MAT`, `DRKSCRN.MAT`, `FOGSCRN.MAT`, `SKIDMARK.MAT`
 - DAT: `CITYANW1.DAT`
 - ACT: `CITYANW1.ACT`
+- DAT-referenced material: `DRKCURB.MAT`
+- Material-referenced pixelmap: `SKIDMARK.PIX`
 
 The start position is `(159.94, -8.5, -225.67)` with yaw `180` degrees.
 `CITYA1X.ACT`/`.DAT` name an additional-object save path in `world.c`; their
-shipped files contain no static street geometry. The normal group above is the
+shipped files contain no static street geometry. The normal group plus the two resolved references above is the
 visual graph needed for the static viewer. Every named file exists in the
 supplied original installation.
 

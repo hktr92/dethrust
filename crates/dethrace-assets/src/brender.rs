@@ -24,6 +24,7 @@ use dethrace_formats::{
     mat::{MatFile, Material},
     pix::{PixFile, PixelType, Pixelmap},
     race::{GalleryRoster, OpponentCatalog, RaceCatalog, initial_player},
+    track_visual::TrackVisualSpec,
 };
 
 use crate::GameDir;
@@ -34,6 +35,18 @@ fn key(name: &str) -> String {
 
 fn read(path: &std::path::Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn actor_model_names(actor: &ActFile) -> HashSet<String> {
+    let mut needed = HashSet::new();
+    let mut actors: Vec<_> = actor.roots.iter().collect();
+    while let Some(node) = actors.pop() {
+        if let Some(name) = &node.model {
+            needed.insert(key(name));
+        }
+        actors.extend(&node.children);
+    }
+    needed
 }
 
 pub fn source_point(point: [f32; 3]) -> Vec3 {
@@ -124,6 +137,33 @@ pub struct VisualScene {
     pub materials: Vec<MatFile>,
     pub models: Vec<DatFile>,
     pub palette: [[u8; 3]; 256],
+}
+
+pub struct TrackSources {
+    pub spec: TrackVisualSpec,
+    pub scene: VisualScene,
+}
+
+impl TrackSources {
+    pub fn load(dir: &GameDir, race_name: &str) -> Result<Self, String> {
+        let races_path = dir.data_path("RACES.TXT")?;
+        let races = RaceCatalog::parse(&read(&races_path)?)
+            .map_err(|e| format!("{}: {e}", races_path.display()))?;
+        let (_, race) = races
+            .find(race_name)
+            .ok_or_else(|| format!("race {race_name} not found"))?;
+        let track_path = dir.asset_path("RACES", &race.track_file)?;
+        let spec = TrackVisualSpec::parse(&read(&track_path)?, &race.track_file)
+            .map_err(|e| format!("{}: {e}", track_path.display()))?;
+        let scene = VisualScene::load(
+            dir,
+            &spec.pixelmaps,
+            &spec.materials,
+            &spec.models,
+            &spec.actor_file,
+        )?;
+        Ok(Self { spec, scene })
+    }
 }
 
 pub struct GalleryEntry {
@@ -270,6 +310,68 @@ impl VisualScene {
         let path = dir.asset_path("ACTORS", actor_file)?;
         let actor =
             ActFile::parse(&read(&path)?).map_err(|e| format!("{}: {e}", path.display()))?;
+        let needed_models = actor_model_names(&actor);
+        // Model material names are registry identifiers. Resolve any names
+        // absent from the track's initial MAT group by their original files.
+        let mut loaded_materials: HashSet<String> = materials
+            .iter()
+            .flat_map(|file| file.materials.iter().map(|mat| key(&mat.identifier)))
+            .collect();
+        for model in models.iter().flat_map(|file| &file.models) {
+            if !needed_models.contains(&key(&model.identifier)) {
+                continue;
+            }
+            for name in &model.materials {
+                if loaded_materials.contains(&key(name)) {
+                    continue;
+                }
+                let path = dir.asset_path("MATERIAL", name).map_err(|e| {
+                    format!("model {} needs material {name}: {e}", model.identifier)
+                })?;
+                let file = MatFile::parse(&read(&path)?)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                for material in &file.materials {
+                    loaded_materials.insert(key(&material.identifier));
+                }
+                if !loaded_materials.contains(&key(name)) {
+                    return Err(format!(
+                        "{} lacks material {name} for model {}",
+                        path.display(),
+                        model.identifier
+                    ));
+                }
+                materials.push(file);
+            }
+        }
+        // Some material maps (notably SKIDMARK.PIX) are loaded later by
+        // world.c rather than listed in the track's initial PIX group.
+        let mut loaded_maps: HashSet<String> = pixelmaps
+            .iter()
+            .flat_map(|file| file.pixelmaps.iter().map(|map| key(&map.identifier)))
+            .collect();
+        for material in materials.iter().flat_map(|file| &file.materials) {
+            if let Some(map) = &material.colour_map
+                && !loaded_maps.contains(&key(map))
+            {
+                let path = dir
+                    .asset_path("REG/PIXELMAP", map)
+                    .or_else(|_| dir.asset_path("PIXELMAP", map))
+                    .map_err(|e| format!("material {} needs {map}: {e}", material.identifier))?;
+                let file = PixFile::parse(&read(&path)?)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                for image in &file.pixelmaps {
+                    loaded_maps.insert(key(&image.identifier));
+                }
+                if !loaded_maps.contains(&key(map)) {
+                    return Err(format!(
+                        "{} lacks pixelmap {map} for material {}",
+                        path.display(),
+                        material.identifier
+                    ));
+                }
+                pixelmaps.push(file);
+            }
+        }
         actor
             .link(
                 &models.iter().collect::<Vec<_>>(),
@@ -346,14 +448,7 @@ impl VisualScene {
             cull_mode: Some(CullFace::Back),
             ..default()
         });
-        let mut needed = HashSet::new();
-        let mut actors: Vec<_> = self.actor.roots.iter().collect();
-        while let Some(actor) = actors.pop() {
-            if let Some(name) = &actor.model {
-                needed.insert(key(name));
-            }
-            actors.extend(&actor.children);
-        }
+        let needed = actor_model_names(&self.actor);
         let mut model_groups = HashMap::new();
         for dat in &self.models {
             for model in &dat.models {
