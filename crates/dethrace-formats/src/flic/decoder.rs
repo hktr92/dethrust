@@ -343,7 +343,7 @@ fn decode_delta(image: &mut IndexedImage, bytes: &[u8]) -> Result<(), FlicDecode
                     .copy_from_slice(reader.take(byte_len).map_err(FlicDecodeErrorKind::Read)?);
             } else {
                 let word = reader.take(2).map_err(FlicDecodeErrorKind::Read)?;
-                for pair in row[range.clone()].chunks_exact_mut(2) {
+                for pair in row[range.clone()].as_chunks_mut::<2>().0 {
                     pair.copy_from_slice(word);
                 }
             }

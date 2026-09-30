@@ -468,7 +468,7 @@ mod tests {
         put_u16(&mut bytes, 6, chunks.len() as u16);
         for chunk in chunks {
             bytes.extend_from_slice(chunk);
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 bytes.push(0);
             }
         }
