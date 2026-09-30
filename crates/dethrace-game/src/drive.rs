@@ -22,6 +22,65 @@ pub struct PlayerVehicle {
     pub simulation: VehicleSimulation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RecoveryPose {
+    position: [f32; 3],
+    orientation_xyzw: [f32; 4],
+}
+
+impl RecoveryPose {
+    fn from_state(state: &VehicleState) -> Self {
+        Self {
+            position: state.position,
+            orientation_xyzw: state.orientation_xyzw,
+        }
+    }
+
+    fn state(self) -> VehicleState {
+        VehicleState {
+            position: self.position,
+            orientation_xyzw: self.orientation_xyzw,
+            ..VehicleState::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryCause {
+    Manual,
+    FellOffWorld,
+    InvalidState,
+}
+
+#[derive(Resource, Debug)]
+struct VehicleRecoveryState {
+    spawn_pose: RecoveryPose,
+    safe_pose: RecoveryPose,
+    safe_pose_age: f32,
+    unsafe_elapsed: f32,
+    recoveries: u32,
+    last_cause: Option<RecoveryCause>,
+}
+
+impl VehicleRecoveryState {
+    fn at_spawn(state: &VehicleState) -> Self {
+        let spawn_pose = RecoveryPose::from_state(state);
+        Self {
+            spawn_pose,
+            safe_pose: spawn_pose,
+            safe_pose_age: 0.0,
+            unsafe_elapsed: 0.0,
+            recoveries: 0,
+            last_cause: None,
+        }
+    }
+}
+
+#[derive(Component)]
+struct ChaseCamera {
+    last_recovery_count: u32,
+}
+
 #[derive(Component)]
 pub struct SimulationVehicleRoot;
 
@@ -66,9 +125,11 @@ impl Plugin for MaimStreetDrivePlugin {
                     toggle_input_telemetry,
                     toggle_vehicle_debug,
                     log_driver_input,
+                    recover_player_vehicle,
                     simulate_player_vehicle,
                     log_vehicle_telemetry,
                     sync_vehicle_presentation,
+                    update_chase_camera,
                     draw_vehicle_debug,
                 )
                     .chain(),
@@ -78,6 +139,9 @@ impl Plugin for MaimStreetDrivePlugin {
 
 const STEERING_DEADZONE: f32 = 0.15;
 const PEDAL_DEADZONE: f32 = 0.03;
+const SAFE_POSE_SPACING_SQUARED: f32 = 8.401_596;
+const RECOVERY_DELAY: f32 = 3.0;
+const RECOVERY_CLEARANCE_STEP: f32 = 0.25;
 
 fn digital_axis(negative: bool, positive: bool) -> f32 {
     positive as i8 as f32 - negative as i8 as f32
@@ -181,27 +245,246 @@ fn toggle_vehicle_debug(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<Vehic
     }
 }
 
+fn orientation_is_valid(state: &VehicleState) -> bool {
+    let length_squared = state
+        .orientation_xyzw
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
+    length_squared.is_finite() && (0.9..=1.1).contains(&length_squared)
+}
+
+fn upright_amount(state: &VehicleState) -> f32 {
+    if !orientation_is_valid(state) {
+        return -1.0;
+    }
+    (Quat::from_array(state.orientation_xyzw).normalize() * Vec3::Y).dot(Vec3::Y)
+}
+
+fn safe_pose_eligible(
+    state: &VehicleState,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+) -> bool {
+    state.is_finite()
+        && upright_amount(state) >= 0.8
+        && state.wheels.iter().filter(|wheel| wheel.grounded).count() >= 3
+        && state.is_chassis_clear(config, collision)
+}
+
+fn remember_safe_position(
+    state: &VehicleState,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+    recovery: &mut VehicleRecoveryState,
+    elapsed: f32,
+) {
+    recovery.safe_pose_age += elapsed;
+    if state.wheels.iter().filter(|wheel| wheel.grounded).count() < 3
+        || !state.is_finite()
+        || upright_amount(state) < 0.8
+    {
+        return;
+    }
+    let position_delta = (Vec3::from_array(state.position)
+        - Vec3::from_array(recovery.safe_pose.position))
+        / config.collision_world_scale;
+    if position_delta.length_squared() > SAFE_POSE_SPACING_SQUARED
+        && safe_pose_eligible(state, config, collision)
+    {
+        recovery.safe_pose = RecoveryPose::from_state(state);
+        recovery.safe_pose_age = 0.0;
+    }
+}
+
+fn recovery_pose_is_clear(
+    pose: RecoveryPose,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+) -> bool {
+    pose.state().is_chassis_clear(config, collision)
+}
+
+fn find_clear_recovery_pose(
+    recovery: &VehicleRecoveryState,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+) -> RecoveryPose {
+    for mut pose in [recovery.safe_pose, recovery.spawn_pose] {
+        for _ in 0..=40 {
+            if recovery_pose_is_clear(pose, config, collision) {
+                return pose;
+            }
+            pose.position[1] += RECOVERY_CLEARANCE_STEP * config.collision_world_scale;
+        }
+    }
+
+    let mut elevated = recovery.spawn_pose;
+    let source_top = collision.bounds().map_or(
+        elevated.position[1] / config.collision_world_scale,
+        |bounds| bounds[1][1],
+    );
+    elevated.position[1] = (source_top + 10.0) * config.collision_world_scale;
+    for _ in 0..40 {
+        if recovery_pose_is_clear(elevated, config, collision) {
+            break;
+        }
+        elevated.position[1] += RECOVERY_CLEARANCE_STEP * config.collision_world_scale;
+    }
+    elevated
+}
+
+fn apply_vehicle_recovery(
+    state: &mut VehicleState,
+    config: &VehicleConfig,
+    collision: &StaticCollisionWorld,
+    recovery: &mut VehicleRecoveryState,
+    cause: RecoveryCause,
+) {
+    let pose = find_clear_recovery_pose(recovery, config, collision);
+    state.position = pose.position;
+    state.orientation_xyzw = pose.orientation_xyzw;
+    state.linear_velocity = [0.0; 3];
+    state.angular_velocity = [0.0; 3];
+    state.gear = 0;
+    state.engine_revs = 0.0;
+    state.wheels = Default::default();
+    state.last_collision_triangle = None;
+    recovery.unsafe_elapsed = 0.0;
+    recovery.safe_pose_age = 0.0;
+    recovery.recoveries += 1;
+    recovery.last_cause = Some(cause);
+}
+
+fn recovery_requested(keys: &ButtonInput<KeyCode>, gamepads: &Query<&Gamepad>) -> bool {
+    keys.just_pressed(KeyCode::KeyR)
+        || gamepads
+            .iter()
+            .any(|gamepad| gamepad.just_pressed(GamepadButton::Start))
+}
+
+fn recover_player_vehicle(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    collision: Res<TrackCollisionWorld>,
+    mut vehicle: ResMut<PlayerVehicle>,
+    mut recovery: ResMut<VehicleRecoveryState>,
+) {
+    if recovery_requested(&keys, &gamepads) {
+        let PlayerVehicle {
+            state,
+            config,
+            driver_input,
+            ..
+        } = &mut *vehicle;
+        apply_vehicle_recovery(
+            state,
+            config,
+            &collision.0,
+            &mut recovery,
+            RecoveryCause::Manual,
+        );
+        *driver_input = DriverInput::default();
+        return;
+    }
+    if !vehicle.state.is_finite() || !orientation_is_valid(&vehicle.state) {
+        let PlayerVehicle {
+            state,
+            config,
+            driver_input,
+            ..
+        } = &mut *vehicle;
+        apply_vehicle_recovery(
+            state,
+            config,
+            &collision.0,
+            &mut recovery,
+            RecoveryCause::InvalidState,
+        );
+        *driver_input = DriverInput::default();
+        return;
+    }
+
+    let below_world = collision.0.bounds().is_some_and(|bounds| {
+        vehicle.state.position[1] / vehicle.config.collision_world_scale < bounds[0][1] - 8.0
+    });
+    let unsafe_pose = below_world || upright_amount(&vehicle.state) < 0.0;
+    if unsafe_pose {
+        recovery.unsafe_elapsed += time.delta_secs();
+    } else {
+        recovery.unsafe_elapsed = 0.0;
+    }
+    if recovery.unsafe_elapsed >= RECOVERY_DELAY {
+        let cause = if below_world {
+            RecoveryCause::FellOffWorld
+        } else {
+            RecoveryCause::InvalidState
+        };
+        let PlayerVehicle {
+            state,
+            config,
+            driver_input,
+            ..
+        } = &mut *vehicle;
+        apply_vehicle_recovery(state, config, &collision.0, &mut recovery, cause);
+        *driver_input = DriverInput::default();
+    }
+}
+
 fn simulate_player_vehicle(
     time: Res<Time>,
     collision: Res<TrackCollisionWorld>,
     mut vehicle: ResMut<PlayerVehicle>,
+    mut recovery: ResMut<VehicleRecoveryState>,
 ) {
-    let PlayerVehicle {
-        state,
-        config,
-        driver_input,
-        simulation,
-        ..
-    } = &mut *vehicle;
-    simulation
-        .advance_frame(time.delta(), state, config, *driver_input, &collision.0)
-        .unwrap_or_else(|error| panic!("player vehicle simulation failed: {error:?}"));
+    let result = {
+        let PlayerVehicle {
+            state,
+            config,
+            driver_input,
+            simulation,
+            ..
+        } = &mut *vehicle;
+        simulation.advance_frame(time.delta(), state, config, *driver_input, &collision.0)
+    };
+    match result {
+        Ok(_) => remember_safe_position(
+            &vehicle.state,
+            &vehicle.config,
+            &collision.0,
+            &mut recovery,
+            time.delta_secs(),
+        ),
+        Err(
+            dethrace_core::vehicle::VehicleSimulationError::NonFiniteState
+            | dethrace_core::vehicle::VehicleSimulationError::InvalidOrientation
+            | dethrace_core::vehicle::VehicleSimulationError::NonFiniteResult,
+        ) => {
+            let PlayerVehicle {
+                state,
+                config,
+                driver_input,
+                ..
+            } = &mut *vehicle;
+            apply_vehicle_recovery(
+                state,
+                config,
+                &collision.0,
+                &mut recovery,
+                RecoveryCause::InvalidState,
+            );
+            *driver_input = DriverInput::default();
+        }
+        Err(error) => panic!("player vehicle simulation failed: {error:?}"),
+    }
 }
 
 fn log_vehicle_telemetry(
     time: Res<Time>,
     vehicle: Res<PlayerVehicle>,
     collision: Res<TrackCollisionWorld>,
+    recovery: Res<VehicleRecoveryState>,
     debug: Res<VehicleDebugSettings>,
     mut elapsed: Local<f32>,
 ) {
@@ -214,14 +497,21 @@ fn log_vehicle_telemetry(
         return;
     }
     *elapsed %= 1.0;
-    let wheels = vehicle.state.wheels;
-    let grounded = wheels.iter().filter(|wheel| wheel.grounded).count();
-    let slipping = wheels.iter().filter(|wheel| wheel.slipping).count();
-    let compression = wheels.map(|wheel| (wheel.compression * 100.0).round() / 100.0);
-    let loads = wheels.map(|wheel| (wheel.normal_load * 100.0).round() / 100.0);
-    let normals = wheels.map(|wheel| wheel.contact_normal.map(|v| (v * 100.0).round() / 100.0));
-    let surface = vehicle
-        .state
+    let state = &vehicle.state;
+    let grounded = state.wheels.iter().filter(|wheel| wheel.grounded).count();
+    let slipping = state.wheels.iter().filter(|wheel| wheel.slipping).count();
+    let scale = vehicle.config.collision_world_scale;
+    let speed = Vec3::from_array(state.linear_velocity).length() / scale;
+    let position = state.position.map(|value| value / scale);
+    let safe_position = recovery.safe_pose.position.map(|value| value / scale);
+    let velocity = state.linear_velocity.map(|value| value / scale);
+    let fixed_hz = vehicle
+        .simulation
+        .settings()
+        .fixed_step
+        .as_secs_f32()
+        .recip();
+    let surface = state
         .last_collision_triangle
         .and_then(|index| collision.0.triangles().get(index))
         .map(|triangle| {
@@ -233,11 +523,14 @@ fn log_vehicle_telemetry(
             )
         });
     bevy::log::info!(
-        "Vehicle gear {}, revs {:.0}, wheels {grounded}/4 ({slipping} slipping), compression {compression:?}, loads {loads:?}, normals {normals:?}, collision surface {surface:?}, velocity {:?}, angular {:?}",
-        vehicle.state.gear,
-        vehicle.state.engine_revs,
-        vehicle.state.linear_velocity,
-        vehicle.state.angular_velocity,
+        "Vehicle speed {speed:.1}, pose {position:?}, velocity {velocity:?}, angular {:?}, gear {}, revs {:.0}, wheels {grounded}/4 ({slipping} slipping), input {:?}, fixed {fixed_hz:.0}Hz, safe pose {safe_position:?} age {:.1}s, recoveries {} {:?}, collision surface {surface:?}",
+        state.angular_velocity,
+        state.gear,
+        state.engine_revs,
+        vehicle.driver_input,
+        recovery.safe_pose_age,
+        recovery.recoveries,
+        recovery.last_cause,
     );
 }
 
@@ -340,7 +633,6 @@ fn spawn_drive_scene(
         .take()
         .expect("Maim Street drive source already used");
     let yaw_degrees = track.spec.start_yaw_degrees;
-    let yaw = yaw_degrees.to_radians();
     let config = player
         .vehicle_config()
         .unwrap_or_else(|error| panic!("could not convert player car mechanics: {error}"));
@@ -350,6 +642,7 @@ fn spawn_drive_scene(
     // The standalone scene uses grid slot zero, which has no row offset upstream.
     let start_position = resolve_start_position(&collision, track.spec.start_position);
     let state = state_at_start(start_position, yaw_degrees, &config);
+    commands.insert_resource(VehicleRecoveryState::at_spawn(&state));
     let simulation = VehicleSimulation::new(VehicleSimulationSettings::default())
         .expect("default vehicle simulation settings are valid");
     commands.insert_resource(TrackCollisionWorld(collision));
@@ -385,9 +678,7 @@ fn spawn_drive_scene(
         commands.entity(vehicle_root).add_child(actor);
     }
 
-    let start = Vec3::from_array(start_position);
-    let rotation = Quat::from_rotation_y(yaw);
-    let camera_position = start + rotation * Vec3::new(0.0, 3.0, -12.0);
+    let (camera_position, look_at) = chase_camera_target(&state, &config);
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -395,8 +686,52 @@ fn spawn_drive_scene(
             far: 2000.0,
             ..default()
         }),
-        Transform::from_translation(camera_position).looking_at(start + Vec3::Y, Vec3::Y),
+        Transform::from_translation(camera_position).looking_at(look_at, Vec3::Y),
+        ChaseCamera {
+            last_recovery_count: 0,
+        },
     ));
+}
+
+fn chase_camera_target(state: &VehicleState, config: &VehicleConfig) -> (Vec3, Vec3) {
+    let root = presentation_transform(state, config);
+    let forward = (root.rotation * -Vec3::Z).with_y(0.0).normalize_or_zero();
+    let forward = if forward.length_squared() < 0.5 {
+        Vec3::Z
+    } else {
+        forward
+    };
+    (
+        root.translation - forward * 12.0 + Vec3::Y * 4.0,
+        root.translation + Vec3::Y + forward * 2.0,
+    )
+}
+
+fn update_chase_camera(
+    time: Res<Time>,
+    vehicle: Res<PlayerVehicle>,
+    recovery: Res<VehicleRecoveryState>,
+    mut cameras: Query<(&mut Transform, &mut ChaseCamera)>,
+) {
+    if !vehicle.state.is_finite() || !orientation_is_valid(&vehicle.state) {
+        return;
+    }
+    let (position, look_at) = chase_camera_target(&vehicle.state, &vehicle.config);
+    let desired = Transform::from_translation(position).looking_at(look_at, Vec3::Y);
+    let blend = 1.0 - (-8.0 * time.delta_secs()).exp();
+    for (mut transform, mut camera) in &mut cameras {
+        if camera.last_recovery_count != recovery.recoveries {
+            transform.translation = desired.translation;
+            transform.rotation = desired.rotation;
+            camera.last_recovery_count = recovery.recoveries;
+        } else {
+            transform.translation = transform.translation.lerp(desired.translation, blend);
+            transform.rotation = transform
+                .rotation
+                .slerp(desired.rotation, blend)
+                .normalize();
+        }
+    }
 }
 
 fn sync_vehicle_presentation(
@@ -415,13 +750,17 @@ fn sync_vehicle_presentation(
 mod tests {
     use bevy::prelude::{Quat, Vec3};
     use dethrace_assets::brender::MECHANICS_WORLD_SCALE;
-    use dethrace_core::vehicle::DriverInput;
+    use dethrace_core::{
+        collision::{StaticCollisionWorld, SurfaceIdentity},
+        vehicle::{DriverInput, VehicleConfig, VehicleState, WheelState},
+    };
+    use std::sync::Arc;
 
     use super::{
-        PlayerControls, normalize_controls, normalize_pedal, normalize_steering,
-        presentation_transform, resolve_start_position, state_at_start,
+        PlayerControls, RecoveryCause, RecoveryPose, VehicleRecoveryState, apply_vehicle_recovery,
+        chase_camera_target, normalize_controls, normalize_pedal, normalize_steering,
+        presentation_transform, resolve_start_position, safe_pose_eligible, state_at_start,
     };
-    use dethrace_core::vehicle::VehicleConfig;
 
     fn pose_config() -> VehicleConfig {
         VehicleConfig {
@@ -450,6 +789,126 @@ mod tests {
             rolling_resistance: [0.02, 0.02],
             max_gears: 4,
         }
+    }
+
+    #[test]
+    fn chase_camera_sits_above_behind_and_looks_ahead_of_car() {
+        let config = pose_config();
+        let state = state_at_start([10.0, 20.0, 30.0], 180.0, &config);
+        let (camera, target) = chase_camera_target(&state, &config);
+        let root = presentation_transform(&state, &config).translation;
+        let forward = Quat::from_array(state.orientation_xyzw) * -Vec3::Z;
+        assert!(camera.y > root.y);
+        assert!((camera - root).dot(forward) < 0.0);
+        assert!((target - root).dot(forward) > 0.0);
+    }
+
+    #[test]
+    fn safe_pose_requires_upright_grounded_and_clear_chassis() {
+        let config = pose_config();
+        let collision = StaticCollisionWorld::default();
+        let grounded = VehicleState {
+            wheels: [WheelState {
+                grounded: true,
+                ..WheelState::default()
+            }; 4],
+            ..VehicleState::default()
+        };
+        assert!(safe_pose_eligible(&grounded, &config, &collision));
+
+        let flipped = VehicleState {
+            orientation_xyzw: Quat::from_rotation_z(std::f32::consts::PI).to_array(),
+            ..grounded
+        };
+        assert!(!safe_pose_eligible(&flipped, &config, &collision));
+    }
+
+    #[test]
+    fn recovery_restores_safe_pose_and_resets_vehicle_motion() {
+        let config = pose_config();
+        let collision = StaticCollisionWorld::default();
+        let safe = VehicleState {
+            position: [12.0, 3.0, -7.0],
+            orientation_xyzw: Quat::from_rotation_y(0.4).to_array(),
+            ..VehicleState::default()
+        };
+        let origin = VehicleState::default();
+        let mut recovery = VehicleRecoveryState {
+            spawn_pose: RecoveryPose::from_state(&origin),
+            safe_pose: RecoveryPose::from_state(&safe),
+            safe_pose_age: 8.0,
+            unsafe_elapsed: 2.0,
+            recoveries: 0,
+            last_cause: None,
+        };
+        let mut state = VehicleState {
+            position: [100.0, -20.0, 40.0],
+            linear_velocity: [20.0, -10.0, 5.0],
+            angular_velocity: [1.0, 2.0, 3.0],
+            gear: 3,
+            engine_revs: 6000.0,
+            ..VehicleState::default()
+        };
+        apply_vehicle_recovery(
+            &mut state,
+            &config,
+            &collision,
+            &mut recovery,
+            RecoveryCause::Manual,
+        );
+        assert_eq!(state.position, safe.position);
+        assert_eq!(state.orientation_xyzw, safe.orientation_xyzw);
+        assert_eq!(state.linear_velocity, [0.0; 3]);
+        assert_eq!(state.angular_velocity, [0.0; 3]);
+        assert_eq!(state.gear, 0);
+        assert_eq!(state.engine_revs, 0.0);
+        assert_eq!(state.wheels, [WheelState::default(); 4]);
+        assert_eq!(recovery.recoveries, 1);
+        assert_eq!(recovery.last_cause, Some(RecoveryCause::Manual));
+    }
+
+    #[test]
+    fn recovery_skips_a_saved_pose_embedded_in_a_wall() {
+        let config = pose_config();
+        let mut collision = StaticCollisionWorld::default();
+        let source = SurfaceIdentity {
+            actor_path: Arc::from("TEST/WALL"),
+            model: Arc::from("WALL"),
+            face_index: 0,
+            material: Some(Arc::from("WALL")),
+        };
+        let a = [0.0, -30.0, -30.0];
+        let b = [0.0, 30.0, -30.0];
+        let c = [0.0, 30.0, 30.0];
+        let d = [0.0, -30.0, 30.0];
+        collision.add_triangle([a, b, c], 0, false, source.clone());
+        collision.add_triangle([a, c, d], 0, false, source);
+        let origin = RecoveryPose {
+            position: [10.0, 0.0, 0.0],
+            orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        };
+        let embedded = RecoveryPose {
+            position: [0.0, 10.0, 0.0],
+            ..origin
+        };
+        let mut recovery = VehicleRecoveryState {
+            spawn_pose: origin,
+            safe_pose: embedded,
+            safe_pose_age: 0.0,
+            unsafe_elapsed: 0.0,
+            recoveries: 0,
+            last_cause: None,
+        };
+        let mut state = embedded.state();
+        apply_vehicle_recovery(
+            &mut state,
+            &config,
+            &collision,
+            &mut recovery,
+            RecoveryCause::Manual,
+        );
+        assert_eq!(state.position, origin.position);
+        assert!(state.is_chassis_clear(&config, &collision));
     }
 
     #[test]

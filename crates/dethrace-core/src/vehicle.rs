@@ -7,6 +7,7 @@ const MAX_STEPS_PER_UPDATE: u32 = 5;
 const WHEEL_QUERY_DISTANCE: f32 = 2.0;
 const WHEEL_SWEEP_MARGIN: f32 = 0.5;
 const CHASSIS_SKIN: f32 = 0.002;
+const POSE_CLEARANCE_TOLERANCE: f32 = 0.01;
 const CHASSIS_FRICTION: f32 = 0.55;
 const CHASSIS_TOI_WINDOW: f32 = 0.01;
 // ponytail: four impacts cap per-step work; raise this if stacked track faces stall motion.
@@ -195,6 +196,23 @@ impl VehicleState {
             && self.engine_revs.is_finite()
             && self.engine_revs >= 0.0
             && self.wheels.iter().all(WheelState::is_finite)
+    }
+
+    /// Checks the source-derived chassis support points for world penetration.
+    pub fn is_chassis_clear(&self, config: &VehicleConfig, world: &StaticCollisionWorld) -> bool {
+        if !self.is_finite() || !config.is_valid() {
+            return false;
+        }
+        chassis_support_points(self.position, self.orientation_xyzw, config)
+            .into_iter()
+            .all(|point| {
+                let source_point = point.map(|value| value / config.collision_world_scale);
+                world
+                    .raycast_chassis(source_point, [0.0; 3], 0.0)
+                    .is_none_or(|hit| {
+                        hit.penetration * config.collision_world_scale <= POSE_CLEARANCE_TOLERANCE
+                    })
+            })
     }
 }
 
@@ -1061,6 +1079,34 @@ mod tests {
         assert!(corners.iter().all(|corner| corner[1] >= -0.01), "{state:?}");
         assert!(state.linear_velocity[1] > -60.0, "{state:?}");
         assert!(state.last_collision_triangle.is_some());
+    }
+
+    #[test]
+    fn chassis_clearance_detects_penetration_using_source_bounds() {
+        let mut world = StaticCollisionWorld::default();
+        let source = SurfaceIdentity {
+            actor_path: Arc::from("TEST/WALL"),
+            model: Arc::from("WALL"),
+            face_index: 0,
+            material: Some(Arc::from("WALL")),
+        };
+        let a = [0.0, -10.0, -10.0];
+        let b = [0.0, 10.0, -10.0];
+        let c = [0.0, 10.0, 10.0];
+        let d = [0.0, -10.0, 10.0];
+        world.add_triangle([a, b, c], 0, false, source.clone());
+        world.add_triangle([a, c, d], 0, false, source);
+        let config = vehicle_config();
+        let embedded = VehicleState {
+            position: [-3.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        let clear = VehicleState {
+            position: [3.0, 0.0, 0.0],
+            ..VehicleState::default()
+        };
+        assert!(!embedded.is_chassis_clear(&config, &world));
+        assert!(clear.is_chassis_clear(&config, &world));
     }
 
     #[test]
