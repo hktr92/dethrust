@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+pub mod gallery;
+
 use bevy::camera::{OrthographicProjection, Projection, ScalingMode};
 use bevy::ecs::system::SystemParam;
 use bevy::image::Image;

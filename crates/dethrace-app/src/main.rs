@@ -5,7 +5,11 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 use bevy::window::WindowResolution;
-use dethrace_assets::{FlicClip, GameDir, brender::VisualScene};
+use dethrace_assets::{
+    FlicClip, GameDir,
+    brender::{GallerySources, VisualScene},
+};
+use dethrace_ui::gallery::{DamageGalleryPlugin, GalleryPresentation};
 use dethrace_ui::{ButtonClip, MENU_CHOICES, MainMenuPlugin, MenuClips};
 
 #[derive(Resource)]
@@ -51,17 +55,56 @@ fn run_debug_car(game_dir: &GameDir) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_damage_gallery(game_dir: &GameDir) -> Result<(), Box<dyn Error>> {
+    let sources = GallerySources::load(game_dir, "Maim Street", 1)?;
+    let background = FlicClip::load(&game_dir.anim_path("SUM2STIL.FLI")?, false)?
+        .frames
+        .into_iter()
+        .last()
+        .ok_or("empty SUM2STIL.FLI")?;
+    App::new()
+        .insert_resource(GalleryPresentation {
+            background,
+            sources: Some(sources),
+        })
+        .insert_resource(ClearColor(Color::BLACK))
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Maim Street Damage Gallery".into(),
+                resolution: WindowResolution::new(640, 400),
+                resizable: false,
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_plugins(DamageGalleryPlugin)
+        .run();
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     if args.len() < 2 || args[0] != OsStr::new("--game-dir") {
-        return Err("usage: dethrace-app --game-dir PATH [--debug-scene car]".into());
+        return Err(
+            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street]"
+                .into(),
+        );
     }
     let game_dir = GameDir::new(PathBuf::from(&args[1]))?;
     if args.len() == 4 && args[2] == OsStr::new("--debug-scene") && args[3] == OsStr::new("car") {
         return run_debug_car(&game_dir);
     }
+    if args.len() == 4
+        && args[2] == OsStr::new("--debug-scene")
+        && args[3] == OsStr::new("damage-gallery-maim-street")
+    {
+        return run_damage_gallery(&game_dir);
+    }
     if args.len() != 2 {
-        return Err("usage: dethrace-app --game-dir PATH [--debug-scene car]".into());
+        return Err(
+            "usage: dethrace-app --game-dir PATH [--debug-scene car|damage-gallery-maim-street]"
+                .into(),
+        );
     }
     let path = game_dir.anim_path("MAI2STIL.FLI")?;
     let still_clip = FlicClip::load(&path, false)?;

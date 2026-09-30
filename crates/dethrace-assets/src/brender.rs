@@ -23,7 +23,7 @@ use dethrace_formats::{
     dat::{DatFile, Model},
     mat::{MatFile, Material},
     pix::{PixFile, PixelType, Pixelmap},
-    race::initial_player,
+    race::{GalleryRoster, OpponentCatalog, RaceCatalog, initial_player},
 };
 
 use crate::GameDir;
@@ -126,7 +126,84 @@ pub struct VisualScene {
     pub palette: [[u8; 3]; 256],
 }
 
+pub struct GalleryEntry {
+    pub name: String,
+    pub scene: VisualScene,
+    pub radius: f32,
+}
+
+pub struct GallerySources {
+    pub entries: Vec<GalleryEntry>,
+    pub roster: GalleryRoster,
+}
+
+impl GallerySources {
+    pub fn load(dir: &GameDir, race_name: &str, seed: u64) -> Result<Self, String> {
+        let races_path = dir.data_path("RACES.TXT")?;
+        let opponents_path = dir.data_path("OPPONENT.TXT")?;
+        let general_path = dir.data_path("GENERAL.TXT")?;
+        let races = RaceCatalog::parse(&read(&races_path)?)
+            .map_err(|e| format!("{}: {e}", races_path.display()))?;
+        let opponents = OpponentCatalog::parse(&read(&opponents_path)?)
+            .map_err(|e| format!("{}: {e}", opponents_path.display()))?;
+        let (_, player_file) = initial_player(&read(&general_path)?)
+            .map_err(|e| format!("{}: {e}", general_path.display()))?;
+        let roster = GalleryRoster::resolve(&races, &opponents, race_name, &player_file, seed)
+            .map_err(|e| e.to_string())?;
+        let player_name = opponents
+            .opponents
+            .iter()
+            .find(|op| op.car_file.eq_ignore_ascii_case(&player_file))
+            .map_or_else(
+                || player_file.trim_end_matches(".TXT").to_owned(),
+                |op| op.name.clone(),
+            );
+        let mut entries = Vec::with_capacity(roster.opponents.len() + 1);
+        for (name, file) in std::iter::once((player_name.as_str(), roster.player_car_file.as_str()))
+            .chain(
+                roster
+                    .opponents
+                    .iter()
+                    .map(|op| (op.name.as_str(), op.car_file.as_str())),
+            )
+        {
+            let scene = VisualScene::car_by_file(dir, file, VisualVariant::Low)?;
+            let radius = scene.principal_radius()?;
+            entries.push(GalleryEntry {
+                name: name.to_owned(),
+                scene,
+                radius,
+            });
+        }
+        Ok(Self { entries, roster })
+    }
+}
+
 impl VisualScene {
+    pub fn principal_radius(&self) -> Result<f32, String> {
+        let model_name = self
+            .actor
+            .roots
+            .first()
+            .and_then(|actor| actor.model.as_ref())
+            .ok_or("principal actor has no model")?;
+        let model = self
+            .models
+            .iter()
+            .flat_map(|file| &file.models)
+            .find(|model| model.identifier.eq_ignore_ascii_case(model_name))
+            .ok_or_else(|| format!("principal model {model_name} not loaded"))?;
+        let radius = model
+            .vertices
+            .iter()
+            .map(|vertex| source_point(vertex.position).length())
+            .fold(0.0_f32, f32::max);
+        if radius <= 0.0 || !radius.is_finite() {
+            return Err(format!("principal model {model_name} has invalid radius"));
+        }
+        Ok(radius)
+    }
+
     pub fn initial_car(dir: &GameDir) -> Result<Self, String> {
         let path = dir.data_path("GENERAL.TXT")?;
         let (_, file) =
