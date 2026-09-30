@@ -20,3 +20,13 @@ export CARMAGEDDON_DIR=/absolute/path/to/CARMA
 
 The current milestone is **M0a, formats foundation**. FLIC parsing and tools
 will be added in later runs.
+
+To check the decoder against your original menu FLICs, set `CARMAGEDDON_DIR`
+and run:
+
+```bash
+cargo test -p dethrace-formats --test original_flics -- --ignored
+```
+
+The normal workspace tests do not require game assets. GOG installations may
+place the FLICs under `DATA/ANIM`; the test also accepts a direct `ANIM` folder.
