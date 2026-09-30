@@ -2149,6 +2149,11 @@ dependencies = [
 [[package]]
 name = "dethrace-app"
 version = "0.1.0"
+dependencies = [
+ "bevy",
+ "dethrace-assets",
+ "dethrace-ui",
+]
 
 [[package]]
 name = "dethrace-assets"
@@ -2185,6 +2190,9 @@ dependencies = [
 [[package]]
 name = "dethrace-ui"
 version = "0.1.0"
+dependencies = [
+ "bevy",
+]
 
 [[package]]
 name = "dispatch"

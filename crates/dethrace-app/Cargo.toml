@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+bevy.workspace = true
+dethrace-assets = { path = "../dethrace-assets" }
+dethrace-ui = { path = "../dethrace-ui" }
