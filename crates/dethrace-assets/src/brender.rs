@@ -211,6 +211,13 @@ impl PlayerCarSources {
                 position.map(|value| value * MECHANICS_WORLD_SCALE)
             }),
             bounds: bounds.map(|point| point.map(|value| value * MECHANICS_WORLD_SCALE)),
+            ride_height: ride_height * MECHANICS_WORLD_SCALE,
+            suspension_travel: [
+                self.mechanics.suspension_give[1] * MECHANICS_WORLD_SCALE,
+                self.mechanics.suspension_give[0] * MECHANICS_WORLD_SCALE,
+            ],
+            suspension_damping: self.mechanics.damping,
+            collision_world_scale: MECHANICS_WORLD_SCALE,
         };
         if !config.is_valid() {
             return Err(format!("{} has invalid converted mechanics", self.file));

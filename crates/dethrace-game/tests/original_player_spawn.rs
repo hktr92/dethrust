@@ -70,13 +70,49 @@ fn resolves_and_spawns_the_original_player_car_at_maim_street_start() {
         }
     }
 
-    let state = state_at_start(start_position, track.spec.start_yaw_degrees);
-    let presentation = presentation_transform(&state);
+    let state = state_at_start(start_position, track.spec.start_yaw_degrees, &config);
+    let presentation = presentation_transform(&state, &config);
     assert_eq!(presentation.translation, Vec3::from_array(start_position));
     assert_eq!(presentation.scale, Vec3::ONE);
     let expected_forward =
         Quat::from_rotation_y(track.spec.start_yaw_degrees.to_radians()) * -Vec3::Z;
     assert!((presentation.rotation * -Vec3::Z - expected_forward).length() < 1e-5);
+
+    let mut settled = state;
+    let simulation = dethrace_core::vehicle::VehicleSimulation::new(
+        dethrace_core::vehicle::VehicleSimulationSettings::default(),
+    )
+    .unwrap();
+    for _ in 0..250 {
+        simulation
+            .step_fixed(
+                &mut settled,
+                &config,
+                dethrace_core::vehicle::DriverInput::default(),
+                &collision,
+            )
+            .unwrap();
+    }
+    assert!(settled.is_finite());
+    assert!(settled.wheels.iter().all(|wheel| wheel.grounded));
+    assert!(
+        settled
+            .linear_velocity
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            < 0.05
+    );
+    assert!(
+        settled
+            .angular_velocity
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+            < 0.01
+    );
 
     let mut images = Assets::<Image>::default();
     let mut materials = Assets::<StandardMaterial>::default();

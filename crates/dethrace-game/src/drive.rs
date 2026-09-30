@@ -1,11 +1,11 @@
 use bevy::input::gamepad::{Gamepad, GamepadAxis, GamepadButton};
 use bevy::prelude::*;
-use dethrace_assets::brender::{
-    MECHANICS_WORLD_SCALE, PlayerCarSources, TrackSources, build_collision_world,
-};
+use dethrace_assets::brender::{PlayerCarSources, TrackSources, build_collision_world};
 use dethrace_core::{
     collision::StaticCollisionWorld,
-    vehicle::{DriverInput, VehicleConfig, VehicleState},
+    vehicle::{
+        DriverInput, VehicleConfig, VehicleSimulation, VehicleSimulationSettings, VehicleState,
+    },
 };
 
 use crate::collision::TrackCollisionWorld;
@@ -19,6 +19,7 @@ pub struct PlayerVehicle {
     pub state: VehicleState,
     pub config: VehicleConfig,
     pub driver_input: DriverInput,
+    pub simulation: VehicleSimulation,
 }
 
 #[derive(Component)]
@@ -26,6 +27,11 @@ pub struct SimulationVehicleRoot;
 
 #[derive(Resource, Default)]
 pub struct DriverInputTelemetry {
+    pub enabled: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct VehicleDebugSettings {
     pub enabled: bool,
 }
 
@@ -51,14 +57,19 @@ pub struct MaimStreetDrivePlugin;
 impl Plugin for MaimStreetDrivePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DriverInputTelemetry>()
+            .init_resource::<VehicleDebugSettings>()
             .add_systems(Startup, spawn_drive_scene)
             .add_systems(
                 Update,
                 (
                     map_player_controls,
                     toggle_input_telemetry,
+                    toggle_vehicle_debug,
                     log_driver_input,
+                    simulate_player_vehicle,
+                    log_vehicle_telemetry,
                     sync_vehicle_presentation,
+                    draw_vehicle_debug,
                 )
                     .chain(),
             );
@@ -164,6 +175,85 @@ fn toggle_input_telemetry(
     }
 }
 
+fn toggle_vehicle_debug(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<VehicleDebugSettings>) {
+    if keys.just_pressed(KeyCode::F2) {
+        debug.enabled = !debug.enabled;
+    }
+}
+
+fn simulate_player_vehicle(
+    time: Res<Time>,
+    collision: Res<TrackCollisionWorld>,
+    mut vehicle: ResMut<PlayerVehicle>,
+) {
+    let PlayerVehicle {
+        state,
+        config,
+        driver_input,
+        simulation,
+        ..
+    } = &mut *vehicle;
+    simulation
+        .advance_frame(time.delta(), state, config, *driver_input, &collision.0)
+        .unwrap_or_else(|error| panic!("player vehicle simulation failed: {error:?}"));
+}
+
+fn log_vehicle_telemetry(
+    time: Res<Time>,
+    vehicle: Res<PlayerVehicle>,
+    debug: Res<VehicleDebugSettings>,
+    mut elapsed: Local<f32>,
+) {
+    if !debug.enabled {
+        *elapsed = 0.0;
+        return;
+    }
+    *elapsed += time.delta_secs();
+    if *elapsed < 1.0 {
+        return;
+    }
+    *elapsed %= 1.0;
+    let wheels = vehicle.state.wheels;
+    let grounded = wheels.iter().filter(|wheel| wheel.grounded).count();
+    let compression = wheels.map(|wheel| (wheel.compression * 100.0).round() / 100.0);
+    let normals = wheels.map(|wheel| wheel.contact_normal.map(|v| (v * 100.0).round() / 100.0));
+    bevy::log::info!(
+        "Vehicle wheels {grounded}/4, compression {compression:?}, normals {normals:?}, velocity {:?}, angular {:?}",
+        vehicle.state.linear_velocity,
+        vehicle.state.angular_velocity,
+    );
+}
+
+fn draw_vehicle_debug(
+    vehicle: Res<PlayerVehicle>,
+    debug: Res<VehicleDebugSettings>,
+    mut gizmos: Gizmos,
+) {
+    if !debug.enabled {
+        return;
+    }
+    for wheel in vehicle.state.wheels {
+        let anchor =
+            Vec3::from_array(wheel.suspension_anchor) / vehicle.config.collision_world_scale;
+        if wheel.grounded {
+            let point =
+                Vec3::from_array(wheel.contact_point) / vehicle.config.collision_world_scale;
+            let normal = Vec3::from_array(wheel.contact_normal);
+            let color = Color::srgb(0.15, 0.95, 0.35);
+            gizmos.line(anchor, point, color);
+            gizmos.line(point, point + normal * 0.6, Color::srgb(1.0, 0.75, 0.1));
+            gizmos.line(point - Vec3::X * 0.12, point + Vec3::X * 0.12, color);
+            gizmos.line(point - Vec3::Z * 0.12, point + Vec3::Z * 0.12, color);
+        } else {
+            gizmos.line(
+                anchor - Vec3::splat(0.12),
+                anchor + Vec3::splat(0.12),
+                Color::srgb(1.0, 0.2, 0.1),
+            );
+        }
+    }
+}
+
 fn log_driver_input(
     vehicle: Res<PlayerVehicle>,
     telemetry: Res<DriverInputTelemetry>,
@@ -195,18 +285,28 @@ pub fn resolve_start_position(world: &StaticCollisionWorld, position: [f32; 3]) 
     resolved
 }
 
-pub fn state_at_start(position: [f32; 3], yaw_degrees: f32) -> VehicleState {
+pub fn state_at_start(
+    position: [f32; 3],
+    yaw_degrees: f32,
+    config: &VehicleConfig,
+) -> VehicleState {
+    let orientation = Quat::from_rotation_y(yaw_degrees.to_radians());
+    let center_of_mass = orientation * Vec3::from_array(config.center_of_mass);
     VehicleState {
-        position: position.map(|value| value * MECHANICS_WORLD_SCALE),
-        orientation_xyzw: Quat::from_rotation_y(yaw_degrees.to_radians()).to_array(),
+        position: (Vec3::from_array(position) * config.collision_world_scale + center_of_mass)
+            .to_array(),
+        orientation_xyzw: orientation.to_array(),
         ..default()
     }
 }
 
-pub fn presentation_transform(state: &VehicleState) -> Transform {
+pub fn presentation_transform(state: &VehicleState, config: &VehicleConfig) -> Transform {
+    let rotation = Quat::from_array(state.orientation_xyzw);
+    let root_position =
+        Vec3::from_array(state.position) - rotation * Vec3::from_array(config.center_of_mass);
     Transform {
-        translation: Vec3::from_array(state.position) / MECHANICS_WORLD_SCALE,
-        rotation: Quat::from_array(state.orientation_xyzw),
+        translation: root_position / config.collision_world_scale,
+        rotation,
         scale: Vec3::ONE,
     }
 }
@@ -232,13 +332,16 @@ fn spawn_drive_scene(
         .unwrap_or_else(|error| panic!("could not build Maim Street collision world: {error}"));
     // The standalone scene uses grid slot zero, which has no row offset upstream.
     let start_position = resolve_start_position(&collision, track.spec.start_position);
-    let state = state_at_start(start_position, yaw_degrees);
+    let state = state_at_start(start_position, yaw_degrees, &config);
+    let simulation = VehicleSimulation::new(VehicleSimulationSettings::default())
+        .expect("default vehicle simulation settings are valid");
     commands.insert_resource(TrackCollisionWorld(collision));
     commands.insert_resource(PlayerVehicle {
         car_file,
         state,
         config,
         driver_input: DriverInput::default(),
+        simulation,
     });
 
     track
@@ -258,7 +361,7 @@ fn spawn_drive_scene(
         .spawn((
             Name::new("Player vehicle simulation root"),
             SimulationVehicleRoot,
-            presentation_transform(&state),
+            presentation_transform(&state, &config),
         ))
         .id();
     for actor in car_roots {
@@ -287,7 +390,7 @@ fn sync_vehicle_presentation(
         return;
     }
     for mut transform in &mut roots {
-        *transform = presentation_transform(&vehicle.state);
+        *transform = presentation_transform(&vehicle.state, &vehicle.config);
     }
 }
 
@@ -301,6 +404,26 @@ mod tests {
         PlayerControls, normalize_controls, normalize_pedal, normalize_steering,
         presentation_transform, resolve_start_position, state_at_start,
     };
+    use dethrace_core::vehicle::VehicleConfig;
+
+    fn pose_config() -> VehicleConfig {
+        VehicleConfig {
+            mass: 1000.0,
+            center_of_mass: [0.5, 0.0, 0.0],
+            principal_inertia: [1.0; 3],
+            wheel_positions: [
+                [-1.0, 1.0, -2.0],
+                [1.0, 1.0, -2.0],
+                [-1.0, 1.0, 2.0],
+                [1.0, 1.0, 2.0],
+            ],
+            bounds: [[-2.0; 3], [2.0; 3]],
+            ride_height: 1.0,
+            suspension_travel: [1.0; 2],
+            suspension_damping: 0.5,
+            collision_world_scale: MECHANICS_WORLD_SCALE,
+        }
+    }
 
     #[test]
     fn opposing_digital_inputs_cancel() {
@@ -380,14 +503,11 @@ mod tests {
 
     #[test]
     fn start_pose_uses_original_position_yaw_and_simulation_scale() {
-        let state = state_at_start([10.0, 20.0, 30.0], 180.0);
+        let config = pose_config();
+        let state = state_at_start([10.0, 20.0, 30.0], 180.0, &config);
         assert_eq!(
-            state.position,
-            [
-                10.0 * MECHANICS_WORLD_SCALE,
-                20.0 * MECHANICS_WORLD_SCALE,
-                30.0 * MECHANICS_WORLD_SCALE,
-            ]
+            presentation_transform(&state, &config).translation,
+            Vec3::new(10.0, 20.0, 30.0)
         );
         let forward = Quat::from_array(state.orientation_xyzw) * -Vec3::Z;
         assert!((forward - Vec3::Z).length() < 1e-6);
@@ -395,8 +515,9 @@ mod tests {
 
     #[test]
     fn presentation_converts_to_track_units_without_scaling_visual_hierarchy() {
-        let state = state_at_start([10.0, 20.0, 30.0], 180.0);
-        let transform = presentation_transform(&state);
+        let config = pose_config();
+        let state = state_at_start([10.0, 20.0, 30.0], 180.0, &config);
+        let transform = presentation_transform(&state, &config);
         assert_eq!(transform.translation, Vec3::new(10.0, 20.0, 30.0));
         assert_eq!(transform.scale, Vec3::ONE);
         let forward = transform.rotation * -Vec3::Z;
